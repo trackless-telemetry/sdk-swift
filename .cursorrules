@@ -1,4 +1,4 @@
-# Trackless iOS SDK — AI Integration Rules
+# Trackless Swift SDK (iOS and macOS) — AI Integration Rules
 
 This package is `TracklessTelemetry`, a privacy-first iOS/macOS analytics SDK. One package covers both platforms. See GUIDE.md in this directory for the complete integration guide; §5 covers the session lifecycle, which differs on macOS.
 

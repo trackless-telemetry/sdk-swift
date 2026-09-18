@@ -1,4 +1,4 @@
-# AGENTS.md — Trackless iOS SDK
+# AGENTS.md — Trackless Swift SDK (iOS and macOS)
 
 Instructions for coding agents integrating `TracklessTelemetry`, a privacy-first iOS and macOS
 analytics SDK (Swift 6.0, iOS 15+ / macOS 12+, Apple system frameworks only — zero third-party

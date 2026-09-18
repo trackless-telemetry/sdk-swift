@@ -1,4 +1,4 @@
-# Trackless iOS SDK — Implementation Guide
+# Trackless Swift SDK (iOS and macOS) — Implementation Guide
 
 > This guide is designed for AI coding assistants. Follow the steps exactly to add privacy-first analytics to any iOS or macOS application. One Swift package covers both; the differences are the session lifecycle (§5) and two lines of macOS setup (§5.1).
 

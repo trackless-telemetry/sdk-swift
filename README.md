@@ -1,4 +1,4 @@
-# Trackless Telemetry iOS SDK
+# Trackless Telemetry Swift SDK
 
 Privacy-first analytics for iOS and macOS apps. Record what features your users use — without tracking who they are.
 
