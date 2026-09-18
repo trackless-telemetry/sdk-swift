@@ -10,12 +10,29 @@ enum TracklessEventType: String, Codable, Sendable {
     case error
 }
 
-/// Error severity levels.
+/// Severity values for the deprecated `severity` parameter on
+/// `Trackless.error(_:severity:code:)`.
+///
+/// The SDK sends two of them — `.error` and `.info` — and the ingest endpoint
+/// stores two. The other three are accepted for installed apps and mapped
+/// before the event is buffered: `.debug` becomes `.info`, `.warning` and
+/// `.fatal` become `.error`.
+///
+/// `.debug`, `.warning` and `.fatal` are deprecated because nothing reads them.
+/// `.info` and `.error` are not, because they are the two levels the wire
+/// carries and the SDK constructs them itself — but the only way to pass either
+/// to `error()` is through its deprecated `severity` parameter, so a caller who
+/// does gets a warning either way.
 public enum TracklessErrorSeverity: String, Codable, Sendable {
+    @available(*, deprecated, message: "Nothing reads `debug` — it is sent as `info`. Call Trackless.info(_:detail:) instead.")
     case debug
+    /// The level `Trackless.info(_:detail:)` sends. Call that rather than passing this to `error()`.
     case info
+    @available(*, deprecated, message: "Nothing reads `warning` — it is sent as `error`. Call Trackless.error(_:code:) instead.")
     case warning
+    /// The level `Trackless.error(_:code:)` sends.
     case error
+    @available(*, deprecated, message: "Nothing reads `fatal` — it is sent as `error`, and no SDK captures crashes. Call Trackless.error(_:code:) instead.")
     case fatal
 }
 
@@ -40,10 +57,15 @@ struct TracklessEventContext: Codable, Sendable, Equatable {
     let language: String?
     let appVersion: String?
     let buildNumber: String?
-    let daysSinceInstall: Int?
     let sdkVersion: String?
-    let distributionChannel: String?
 
+    /// The `platform` default is the literal `"ios"`, **not**
+    /// `ContextDetection.platform`, on purpose: this is a plain data struct and a
+    /// host-dependent default would make every test that constructs a bare
+    /// `TracklessEventContext()` assert a different value on a macOS host than on
+    /// an iOS one. Production code never relies on the default — `detect()` and
+    /// the pre-configure placeholder in `TracklessState` both pass
+    /// `ContextDetection.platform` explicitly.
     init(
         platform: String = "ios",
         osVersion: String? = nil,
@@ -52,9 +74,7 @@ struct TracklessEventContext: Codable, Sendable, Equatable {
         language: String? = nil,
         appVersion: String? = nil,
         buildNumber: String? = nil,
-        daysSinceInstall: Int? = nil,
-        sdkVersion: String? = nil,
-        distributionChannel: String? = nil
+        sdkVersion: String? = nil
     ) {
         self.platform = platform
         self.osVersion = osVersion
@@ -63,9 +83,7 @@ struct TracklessEventContext: Codable, Sendable, Equatable {
         self.language = language
         self.appVersion = appVersion
         self.buildNumber = buildNumber
-        self.daysSinceInstall = daysSinceInstall
         self.sdkVersion = sdkVersion
-        self.distributionChannel = distributionChannel
     }
 }
 

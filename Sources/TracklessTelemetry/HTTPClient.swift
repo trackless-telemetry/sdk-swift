@@ -22,12 +22,16 @@ enum HTTPClient {
     ///   - endpoint: Ingest URL
     ///   - apiKey: API key (tl_* format)
     ///   - payload: Event payload
+    ///   - timeoutSeconds: Request timeout. Defaults to `flushTimeoutSeconds`;
+    ///     the macOS termination path shortens it so the last send cannot
+    ///     outlive the quit budget that is waiting on it.
     /// - Returns: The HTTP status code and response body
     /// - Throws: Network errors or timeout
     static func sendPayload(
         endpoint: String,
         apiKey: String,
-        payload: TracklessEventPayload
+        payload: TracklessEventPayload,
+        timeoutSeconds: TimeInterval = flushTimeoutSeconds
     ) async throws -> SendResult {
         guard let url = URL(string: endpoint) else {
             throw URLError(.badURL)
@@ -37,7 +41,7 @@ enum HTTPClient {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue(apiKey, forHTTPHeaderField: "X-Api-Key")
-        request.timeoutInterval = flushTimeoutSeconds
+        request.timeoutInterval = timeoutSeconds
 
         let encoder = JSONEncoder()
         request.httpBody = try encoder.encode(payload)

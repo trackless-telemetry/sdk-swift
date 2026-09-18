@@ -12,23 +12,41 @@ import UIKit
 /// - NO carrier info or telephony data
 /// - NO IP-based geolocation (Invariant 4)
 /// - Region from system Locale only, never from network info
+/// - NO record about this installation or its acquisition: no install date, no
+///   App Store receipt, no file timestamps. Only runtime properties the OS
+///   exposes to every app and constants compiled into the app itself.
 enum ContextDetection {
 
-    private static let sdkVersion = "ios/0.4.1"
+    /// The version this build reports, without the platform prefix.
+    private static let version = "0.5.0"
+
+    /// The `platform` dimension for this build.
+    ///
+    /// `#if os(macOS)` is true only for a **native AppKit** build. Mac Catalyst
+    /// and "Designed for iPad" apps compile as `os(iOS)` and so keep reporting
+    /// `"ios"` — which is correct: they are UIKit apps with UIKit's lifecycle,
+    /// and the SDK behaves as it does on an iPad there.
+    #if os(macOS)
+    static let platform = "macos"
+    #else
+    static let platform = "ios"
+    #endif
+
+    /// `<platform>/<version>`, e.g. `"macos/0.5.0"`. One Swift package publishes
+    /// both, so the version after the slash is the same on either platform.
+    static let sdkVersion = "\(platform)/\(version)"
 
     /// Detect coarse device context. Captured once at configure time.
     static func detect() -> TracklessEventContext {
         TracklessEventContext(
-            platform: "ios",
+            platform: platform,
             osVersion: detectOsVersion(),
             deviceClass: detectDeviceClass(),
             region: detectRegion(),
             language: detectLanguage(),
             appVersion: detectAppVersion(),
             buildNumber: detectBuildNumber(),
-            daysSinceInstall: detectDaysSinceInstall(),
-            sdkVersion: sdkVersion,
-            distributionChannel: detectDistributionChannel()
+            sdkVersion: sdkVersion
         )
     }
 
@@ -99,43 +117,5 @@ enum ContextDetection {
     /// Build number from Bundle.main (e.g., "42").
     private static func detectBuildNumber() -> String? {
         Bundle.main.infoDictionary?["CFBundleVersion"] as? String
-    }
-
-    /// Days since first install, derived from the Documents directory creation date.
-    /// Read-only filesystem query — no disk writes.
-    private static func detectDaysSinceInstall() -> Int? {
-        guard let documentsURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else {
-            return nil
-        }
-        guard let attributes = try? FileManager.default.attributesOfItem(atPath: documentsURL.path),
-              let creationDate = attributes[.creationDate] as? Date else {
-            return nil
-        }
-        let days = Calendar.current.dateComponents([.day], from: creationDate, to: Date()).day
-        return days
-    }
-
-    /// Detect distribution channel: "debug", "testflight", "app_store", or "unknown".
-    ///
-    /// Returns "unknown" when the receipt URL is missing, or when it points at the
-    /// production receipt path but no receipt file exists yet — both can occur during
-    /// Apple's Beta App Review, where the reviewer's environment doesn't always
-    /// produce a normal sandbox receipt. Treating these as "unknown" avoids
-    /// misclassifying reviewer sessions as real App Store installs.
-    private static func detectDistributionChannel() -> String {
-        #if DEBUG
-        return "debug"
-        #else
-        guard let receiptURL = Bundle.main.appStoreReceiptURL else {
-            return "unknown"
-        }
-        if receiptURL.lastPathComponent == "sandboxReceipt" {
-            return "testflight"
-        }
-        if FileManager.default.fileExists(atPath: receiptURL.path) {
-            return "app_store"
-        }
-        return "unknown"
-        #endif
     }
 }

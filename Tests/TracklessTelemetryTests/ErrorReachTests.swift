@@ -169,6 +169,11 @@ struct ErrorReachEncodingTests {
 @Suite("Error Reach — recordError integration")
 struct ErrorReachIntegrationTests {
 
+    /// A severity an already-installed app may still send. Built from the raw
+    /// value so these tests keep exercising the legacy input without naming a
+    /// deprecated enum case (which would warn on every build).
+    static let legacyWarning = TracklessErrorSeverity(rawValue: "warning")!
+
     /// A configured state with a long flush interval so the periodic timer never fires
     /// during the test. Tests must call `setEnabled(false)` at the end to cancel the
     /// timer cleanly.
@@ -228,8 +233,11 @@ struct ErrorReachIntegrationTests {
     func dedupIgnoresSeverityAndCode() async {
         let state = await makeConfiguredState()
 
+        // `legacyWarning` is spelled through `rawValue` rather than `.warning`
+        // so this test exercises what an installed app still sends without
+        // naming the deprecated case.
         await state.recordError(name: "payment_failed", severity: .error, code: "e500")
-        await state.recordError(name: "payment_failed", severity: .warning, code: "etimedout")
+        await state.recordError(name: "payment_failed", severity: Self.legacyWarning, code: "etimedout")
         let events = await state.drainBufferForTesting()
 
         let marked = events.filter { $0.type == .error && $0.firstOccurrences != nil }
@@ -244,7 +252,7 @@ struct ErrorReachIntegrationTests {
         let state = await makeConfiguredState()
 
         await state.recordError(name: "payment_failed", severity: .error, code: nil)
-        await state.recordError(name: "api_timeout", severity: .warning, code: nil)
+        await state.recordError(name: "api_timeout", severity: Self.legacyWarning, code: nil)
         let events = await state.drainBufferForTesting()
         #expect(errorEvent(in: events, name: "payment_failed")?.firstOccurrences == 1)
         #expect(errorEvent(in: events, name: "api_timeout")?.firstOccurrences == 1)

@@ -7,10 +7,24 @@ struct ContextDetectionTests {
 
     // MARK: - Platform
 
-    @Test("Platform is always ios")
-    func platformIsIos() {
+    /// The platform this test bundle is running on. `swift test` is a macOS host
+    /// build, so this is `"macos"` locally and `"ios"` in a simulator run — which
+    /// is the point: both values are exercised, and neither is written twice.
+    ///
+    /// Mac Catalyst and "Designed for iPad" builds are `os(iOS)` and so report
+    /// `"ios"`, by design.
+    private static let expectedPlatform: String = {
+        #if os(macOS)
+        return "macos"
+        #else
+        return "ios"
+        #endif
+    }()
+
+    @Test("Platform is macos on a native macOS build and ios elsewhere")
+    func platformMatchesBuild() {
         let ctx = ContextDetection.detect()
-        #expect(ctx.platform == "ios")
+        #expect(ctx.platform == Self.expectedPlatform)
     }
 
     // MARK: - OS Version
@@ -67,7 +81,7 @@ struct ContextDetectionTests {
     @Test("Context struct does not contain any identifiers")
     func noIdentifiers() {
         let ctx = ContextDetection.detect()
-        #expect(ctx.platform == "ios")
+        #expect(ctx.platform == Self.expectedPlatform)
         if let osVersion = ctx.osVersion {
             #expect(Int(osVersion) != nil)
         }
@@ -77,14 +91,39 @@ struct ContextDetectionTests {
         }
     }
 
+    // MARK: - No install metadata, no distribution channel
+
+    /// The SDK reads nothing the OS, the filesystem or the App Store keeps about
+    /// this installation. Before 0.5.0 it read an install date (App Store
+    /// receipt, then a file creation date) and sent it as `daysSinceInstall`,
+    /// and sent the install source as `distributionChannel`. If either key
+    /// ever reappears on the wire, an install-metadata read came back.
+    @Test("The encoded context carries no daysSinceInstall or distributionChannel, only runtime/compiled fields")
+    func encodedContextHasNoInstallAgeOrChannel() throws {
+        let data = try JSONEncoder().encode(ContextDetection.detect())
+        let object = try #require(
+            try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        )
+        #expect(object["daysSinceInstall"] == nil)
+        #expect(object["distributionChannel"] == nil)
+        let allowed: Set<String> = [
+            "platform", "osVersion", "deviceClass", "region", "language",
+            "appVersion", "buildNumber", "sdkVersion",
+        ]
+        #expect(Set(object.keys).isSubset(of: allowed))
+    }
+
     // MARK: - SDK Version
 
-    @Test("SDK version is present and starts with ios/")
+    @Test("SDK version is present and prefixed with this build's platform")
     func sdkVersionPresent() {
         let ctx = ContextDetection.detect()
         #expect(ctx.sdkVersion != nil)
         if let sdkVersion = ctx.sdkVersion {
-            #expect(sdkVersion.hasPrefix("ios/"))
+            #expect(sdkVersion.hasPrefix("\(Self.expectedPlatform)/"))
+            // One Swift package, one changelog, one tag: the version after the
+            // slash must not vary by platform.
+            #expect(sdkVersion.split(separator: "/").last?.split(separator: ".").count == 3)
         }
     }
 

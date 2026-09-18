@@ -1,10 +1,10 @@
 # Trackless iOS SDK — AI Integration Rules
 
-This package is `TracklessTelemetry`, a privacy-first iOS/macOS analytics SDK. See GUIDE.md in this directory for the complete integration guide.
+This package is `TracklessTelemetry`, a privacy-first iOS/macOS analytics SDK. One package covers both platforms. See GUIDE.md in this directory for the complete integration guide; §5 covers the session lifecycle, which differs on macOS.
 
 ## Quick Reference
 
-1. Install via SPM: `https://github.com/trackless-telemetry/sdk-ios` (latest release)
+1. Install via SPM: `https://github.com/trackless-telemetry/sdk-swift` (latest release)
 2. Configure once at app launch with just an API key:
    ```swift
    import TracklessTelemetry
@@ -12,15 +12,18 @@ This package is `TracklessTelemetry`, a privacy-first iOS/macOS analytics SDK. S
    ```
 3. Call typed event methods anywhere:
    - `Trackless.view("home")` — screen views (optional detail: `Trackless.view("settings", detail: "profile")`)
-   - `Trackless.feature("export_clicked")` — feature usage (optional detail: `Trackless.feature("theme", detail: "dark")`)
+   - `Trackless.feature("export", detail: "csv")` — feature usage; name the feature, put the variant in the optional detail
    - `Trackless.funnel("checkout", stepIndex: 0, step: "view_cart")` — multi-step flows
    - `Trackless.performance("api_fetch", durationSeconds: 0.342)` — timing in seconds (optional threshold: `Trackless.performance("api_fetch", durationSeconds: 0.342, thresholdSeconds: 2.0)`)
-   - `Trackless.error("payment_failed", severity: .error, code: "DECLINED")` — error tracking
+   - `Trackless.error("payment_failed", code: "DECLINED")` — something went wrong; counts toward errors per session and every alert
+   - `Trackless.info("tier", detail: "paid")` — something worth counting that the user did not do and that did not go wrong; never counts toward errors or alerts
 
 ## Important Rules
 
 - Do NOT create an analytics wrapper class (`Analytics.swift`, `AnalyticsService`, `TelemetryManager`) — `Trackless` is already a thread-safe static singleton; call it directly
-- `detail:` is a SEPARATE parameter, never concatenated into the name: `Trackless.feature("theme", detail: "dark")`, not `Trackless.feature("theme_dark")` — the dashboard groups detail distributions per name
+- `detail:` is a SEPARATE parameter, never concatenated into the name: `Trackless.feature("export", detail: "csv")`, not `Trackless.feature("export_csv")` — the dashboard groups detail distributions per name
+- Two levels only: `error(_:code:)` for what went wrong, `info(_:detail:)` for what did not. Call `info()` once per session for a property you want a session split on (`Trackless.info("tier", detail: store.isPaid ? "paid" : "free")`) — it counts sessions, not people. Report configuration many sessions share, never anything about the person. Never share a name between `error()` and `info()`
+- The `severity:` parameter on `error()` is deprecated but still compiles: `.error`, `.warning` and `.fatal` are sent as `error`, `.info` and `.debug` as `info`
 - The endpoint defaults to `https://api.tracklesstelemetry.com` — do NOT require the user to provide it
 - Store the API key in xcconfig or Info.plist, not hardcoded in committed source
 - Event names and fields (`detail`, `step`, `code`) are auto-normalized: lowercased, spaces/special chars replaced with `_`, trimmed, truncated to 100 chars. Developers can pass natural strings like `"Sign Up Button"` (becomes `"sign_up_button"`). Use the optional `detail` parameter on `feature()` and `view()` to distinguish variants — dashboard auto-groups features with detail values into donut charts
@@ -28,6 +31,16 @@ This package is `TracklessTelemetry`, a privacy-first iOS/macOS analytics SDK. S
 - All methods are non-blocking, non-throwing, and safe to call from any thread
 - Environment auto-detects: DEBUG → `.sandbox`, Release → `.production`
 - App version and build number are auto-read from Bundle.main
+- The SDK sends no distribution channel and reads nothing about the installation — no install date, no install source, no App Store receipt, no file timestamps — so do NOT add code that reads any of them, and do NOT add StoreKit
+- The package ships `Sources/TracklessTelemetry/PrivacyInfo.xcprivacy` — do NOT add a duplicate declaration for the SDK to the host app's privacy manifest
 - No IDFA/IDFV — no App Tracking Transparency prompt needed
 - Sessions are managed automatically via app lifecycle notifications
 - Use `.trackView("name")` view modifier pattern for SwiftUI view tracking
+
+## macOS (native AppKit)
+
+- A sandboxed Mac app MUST have `com.apple.security.network.client` in its `.entitlements`, or every flush fails silently — add it when you add the SDK
+- Native macOS reports `platform: "macos"`; Mac Catalyst and "Designed for iPad" apps are UIKit and report `"ios"`
+- Sessions end on an idle timeout (`sessionIdleTimeoutSeconds`, default 300, clamped to 30–3600) rather than on background, and a session's duration is truncated at the moment the app resigned active — idle time is never counted
+- Call `await Trackless.destroy()` in `applicationWillTerminate(_:)` for a deterministic final flush; the SDK's own `willTerminateNotification` handler is a bounded ~2s best effort
+- A menu-bar / `LSUIElement` app never becomes or resigns active, so its session runs for the process lifetime — end it explicitly if that matters

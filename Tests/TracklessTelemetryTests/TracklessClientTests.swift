@@ -59,10 +59,13 @@ struct TracklessClientTests {
     @Test("EventBuffer: error events aggregate by severity+code")
     func errorEventsAggregate() async {
         let buffer = EventBuffer()
-        await buffer.add(TracklessEvent(type: .error, name: "crash", severity: .fatal, code: "E001"))
-        await buffer.add(TracklessEvent(type: .error, name: "crash", severity: .fatal, code: "E001"))
+        // The buffer keys on whatever severity it is handed. `recordError` maps
+        // before it gets here, so in practice this is `.error` or `.info`; the
+        // rollup key itself is severity-agnostic and tested as such.
+        await buffer.add(TracklessEvent(type: .error, name: "crash", severity: .error, code: "E001"))
+        await buffer.add(TracklessEvent(type: .error, name: "crash", severity: .error, code: "E001"))
         // Different code = different entry
-        await buffer.add(TracklessEvent(type: .error, name: "crash", severity: .fatal, code: "E002"))
+        await buffer.add(TracklessEvent(type: .error, name: "crash", severity: .error, code: "E002"))
 
         let size = await buffer.totalSize
         #expect(size == 2)
