@@ -78,7 +78,7 @@ Add to your target:
 .target(
     name: "MyApp",
     dependencies: [
-        .product(name: "TracklessTelemetry", package: "sdk-ios")
+        .product(name: "TracklessTelemetry", package: "sdk-swift")
     ]
 )
 ```
