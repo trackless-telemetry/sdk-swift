@@ -35,6 +35,7 @@ This package is `TracklessTelemetry`, a privacy-first iOS/macOS analytics SDK. O
 - The package ships `Sources/TracklessTelemetry/PrivacyInfo.xcprivacy` — do NOT add a duplicate declaration for the SDK to the host app's privacy manifest
 - No IDFA/IDFV — no App Tracking Transparency prompt needed
 - Sessions are managed automatically via app lifecycle notifications
+- To change the API key at runtime (a user switching organization), call `configure()` again with the new key: the current session ends and its buffered events are sent under the previous key. A repeat call with identical settings is a no-op
 - Use `.trackView("name")` view modifier pattern for SwiftUI view tracking
 
 ## macOS (native AppKit)

@@ -5,6 +5,14 @@ All notable changes to the Trackless Telemetry Swift SDK (iOS and macOS) will be
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] - 2026-10-14
+
+### Fixed
+
+- **A second `configure()` no longer loses data or orphans a session.** Calling `configure()` again — typically with a new API key when a user switches organization — used to replace the event buffer without flushing it and never ended the running session, so everything buffered under the old key was silently dropped and that session had a start with no end. Now a repeat call with any setting changed ends the current session and flushes it, with everything buffered before the call, under the **previous** key, endpoint, environment and context; the new session then starts under the new settings exactly as at launch. Every flush also reads its key, endpoint and context once, before it sends, so a `configure()` that lands mid-flush cannot send an already-drained batch under the new key.
+- **A repeat `configure()` with identical settings is now a no-op.** An app that calls `configure()` from a view or scene that re-runs used to start a new session on every call, inflating session counts. With every setting unchanged (API key, endpoint, resolved environment, `enabled`, flush interval, debug logging, warning suppression, idle timeout), the running session and buffer are kept and only `onError` is replaced.
+- **An opt-out no longer leads to a later send.** `setEnabled(false)` discarded the buffer but left the session open, so a later `destroy()`, background or idle timeout still sent that session's end. It now drops the session without sending anything, and `setEnabled(true)` starts a new session.
+
 ## [0.5.0] - 2026-09-18
 
 ### Added

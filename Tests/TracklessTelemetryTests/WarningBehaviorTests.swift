@@ -9,6 +9,7 @@ struct WarningBehaviorTests {
     /// enough that no network activity happens during a test.
     private func testConfig(
         suppressWarnings: Bool = false,
+        flushIntervalSeconds: TimeInterval = 3600,
         onError: (@Sendable (Error) -> Void)? = nil
     ) -> TracklessConfig {
         TracklessConfig(
@@ -17,7 +18,7 @@ struct WarningBehaviorTests {
             environment: .production,
             enabled: true,
             onError: onError,
-            flushIntervalSeconds: 3600,
+            flushIntervalSeconds: flushIntervalSeconds,
             debugLogging: false,
             suppressWarnings: suppressWarnings
         )
@@ -98,7 +99,7 @@ struct WarningBehaviorTests {
 
     @Test("Buffer-full warning is re-armed when a new session starts")
     func bufferFullWarningResetsOnNewSession() async {
-        let state = TracklessState()
+        let state = TracklessState(transport: TransportRecorder().transport)
         let recorder = WarningRecorder()
         await state.setOnWarningForTesting { recorder.record($0) }
 
@@ -107,8 +108,9 @@ struct WarningBehaviorTests {
         await state.recordEvent(type: .feature, name: "one")
         await state.recordEvent(type: .feature, name: "two")
 
-        // Reconfiguring starts a new session, which re-arms the warning.
-        await state.configure(testConfig())
+        // Reconfiguring with a changed setting starts a new session, which
+        // re-arms the warning. (Identical settings would keep the session.)
+        await state.configure(testConfig(flushIntervalSeconds: 1800))
         await state.replaceBufferForTesting(maxItems: 1)
         await state.recordEvent(type: .feature, name: "three")
         await state.recordEvent(type: .feature, name: "four")

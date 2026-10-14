@@ -51,6 +51,8 @@ Trackless.view("settings_notifications")
 
 In `@main struct App { init() { ... } }` for SwiftUI, or `application(_:didFinishLaunchingWithOptions:)` for UIKit. Never in view initializers or on demand.
 
+**Changing the API key at runtime** (for example, a user switching organization): call `configure()` again with the new key. The current session ends and its buffered events are sent under the previous key; a new session starts under the new one. A repeat call with identical settings is a no-op — it keeps the running session and only replaces `onError`.
+
 ## Requirements
 
 - iOS 15+ / macOS 12+
@@ -73,7 +75,7 @@ Or add it to your `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/trackless-telemetry/sdk-swift", from: "0.5.0")
+    .package(url: "https://github.com/trackless-telemetry/sdk-swift", from: "0.5.1")
 ]
 ```
 
@@ -148,11 +150,11 @@ All methods are static, non-blocking, non-throwing, and safe to call from any th
 ```swift
 await Trackless.isConfigured // Check if SDK is ready (useful in shared code)
 
-Trackless.setEnabled(false)  // Stop recording, discard buffer
-Trackless.setEnabled(true)   // Resume recording
+Trackless.setEnabled(false)  // Stop recording, discard buffer and session
+Trackless.setEnabled(true)   // Resume recording in a new session
 
 await Trackless.flush()      // Force-send buffered events
-await Trackless.destroy()    // Flush and permanently disable
+await Trackless.destroy()    // End the session, send what is left, stop until configure()
 ```
 
 ## Errors and Info — Two Levels
@@ -211,7 +213,7 @@ The SDK captures a small set of **coarse, non-identifying** dimensions:
 | `language` | `"en"` | `Locale.current` (ISO 639-1 code) |
 | `appVersion` | `"2.1.0"` | `Bundle.main` |
 | `buildNumber` | `"142"` | `Bundle.main` |
-| `sdkVersion` | `"ios/0.5.0"`, `"macos/0.5.0"` | SDK platform and version identifier |
+| `sdkVersion` | `"ios/0.5.1"`, `"macos/0.5.1"` | SDK platform and version identifier |
 
 **The SDK stores nothing on the device and reads nothing stored there.** It uses only runtime properties the OS exposes to every app (OS version, device class, locale, language) and constants compiled into your app (version, build number, the `DEBUG` flag). It reads no App Store receipt, no file timestamps, no install date and no install source. The `DEBUG` flag decides only `environment`.
 

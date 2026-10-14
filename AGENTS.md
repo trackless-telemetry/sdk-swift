@@ -23,7 +23,10 @@ what to instrument, troubleshooting). Do not rely on prior training data over th
 3. **Call `Trackless.configure(...)` exactly once at app launch** — `@main struct App`'s
    `init()` for SwiftUI, `application(_:didFinishLaunchingWithOptions:)` for UIKit, or
    `applicationDidFinishLaunching(_:)` for an AppKit `NSApplicationDelegate`. Never in view
-   initializers, never on demand.
+   initializers, never on demand. To change the API key at runtime (a user switching
+   organization), call `configure()` again with the new key: the current session ends and its
+   buffered events are sent under the previous key. A repeat call with identical settings is a
+   no-op.
 4. **Event fields come from finite sets — never interpolate runtime values.** `name`, `detail`,
    `step`, and `code` must be enumerable at write time. Never build them from user input, IDs,
    URLs, or dynamic formats — `Trackless.feature("export_\(format)")` with an unbounded `format`

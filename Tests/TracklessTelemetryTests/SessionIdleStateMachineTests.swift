@@ -22,8 +22,13 @@ struct SessionIdleStateMachineTests {
     ) async -> TracklessState {
         // A private NotificationCenter: observers registered by `configure()`
         // never reach `.default`, so a real system notification during a test
-        // run cannot perturb it.
-        let state = TracklessState(clock: clock, notificationCenter: NotificationCenter())
+        // run cannot perturb it. The recording transport keeps a re-configure's
+        // flush of the session it retires off the network.
+        let state = TracklessState(
+            clock: clock,
+            notificationCenter: NotificationCenter(),
+            transport: TransportRecorder().transport
+        )
         if let onWarning {
             await state.setOnWarningForTesting(onWarning)
         }
@@ -312,8 +317,8 @@ struct SessionIdleStateMachineTests {
         #expect(await state.hasIdleTimerForTesting() == false)
     }
 
-    @Test("A window cancelled by a disable/enable toggle does not leave the duration truncated")
-    func toggleInsideWindowDoesNotTruncateDuration() async {
+    @Test("A disable/enable toggle inside a window starts a new session timed from the re-enable")
+    func toggleInsideWindowStartsNewSession() async {
         let clock = FakeClock()
         let state = await makeState(clock: clock)
 
@@ -332,14 +337,17 @@ struct SessionIdleStateMachineTests {
         await state.handleAppDidResignActive(at: clock.now)
         await state.handleIdleTimeout()
 
-        let end = sessionEvent(in: await state.drainBufferForTesting(), named: "end")
-        #expect(end?.duration == 3800)
+        // The opt-out dropped the first session unsent; the new one runs from
+        // T+100 to T+3800. (Its start already went out with the resign flush.)
+        let events = await state.drainBufferForTesting()
+        #expect(events.filter { $0.type == .session && $0.name == "end" }.count == 1)
+        #expect(sessionEvent(in: events, named: "end")?.duration == 3700)
 
         await state.setEnabled(false)
     }
 
-    @Test("A window cancelled by a disable/enable toggle still ends the session once it has lapsed")
-    func toggleThenLateActivationEndsAndRestarts() async {
+    @Test("A late activation after a disable/enable toggle continues the session the toggle started")
+    func toggleThenLateActivationContinuesNewSession() async {
         let clock = FakeClock()
         let state = await makeState(clock: clock)
 
@@ -352,16 +360,18 @@ struct SessionIdleStateMachineTests {
         clock.advance(900)
         await state.handleAppDidBecomeActive(at: clock.now)
 
+        // The toggle cancelled the window, so nothing lapses: no end, and only
+        // the start setEnabled(true) recorded.
         let events = await state.drainBufferForTesting()
-        #expect(sessionEvent(in: events, named: "end")?.duration == 100)
-        #expect(sessionEvent(in: events, named: "start") != nil)
+        #expect(sessionEvent(in: events, named: "end") == nil)
+        #expect(events.filter { $0.type == .session && $0.name == "start" }.count == 1)
         #expect(await state.isSessionActiveForTesting())
         #expect(await state.isSessionMarkedInactiveForTesting() == false)
 
         await state.setEnabled(false)
     }
 
-    @Test("Re-configure() cancels a pending idle window")
+    @Test("Re-configure() with a new key cancels a pending idle window")
     func reconfigureCancelsIdleWindow() async {
         let clock = FakeClock()
         let state = await makeState(clock: clock)
@@ -371,7 +381,7 @@ struct SessionIdleStateMachineTests {
 
         await state.configure(
             TracklessConfig(
-                apiKey: "tl_test",
+                apiKey: "tl_test_other",
                 endpoint: "http://127.0.0.1:9",
                 environment: .sandbox,
                 flushIntervalSeconds: 3600,

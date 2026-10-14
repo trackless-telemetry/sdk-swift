@@ -110,6 +110,12 @@ public final class Trackless: Sendable {
 
     /// Configure the SDK and start a new session.
     ///
+    /// Call it once at launch. Calling it again with a different API key (or any
+    /// other setting) ends the current session and sends its buffered events
+    /// under the previous key before the new settings take effect; calling it
+    /// again with identical settings keeps the current session and only
+    /// replaces `onError`.
+    ///
     /// - Parameter sessionIdleTimeoutSeconds: **macOS only.** How long the app
     ///   may sit inactive before the current session ends; the next activation
     ///   starts a fresh one. Clamped to 30–3600 seconds, with one warning when it
@@ -221,14 +227,15 @@ public final class Trackless: Sendable {
         await state.flush()
     }
 
-    /// Toggle event recording. Disabling discards buffered data.
+    /// Toggle event recording. Disabling discards buffered data and drops the session without
+    /// sending its end; enabling again starts a new session.
     public static func setEnabled(_ isEnabled: Bool) {
         Task {
             await state.setEnabled(isEnabled)
         }
     }
 
-    /// Flush remaining events and clean up. Permanently disables the instance.
+    /// End the session, flush remaining events and clean up. Events are dropped until `configure()` is called again.
     public static func destroy() async {
         await state.destroy()
     }
@@ -257,6 +264,15 @@ public final class Trackless: Sendable {
 private let invalidEventNameReason =
     "it normalized to an empty or disallowed value (raw name omitted: it may contain PII)"
 
+/// Sends one payload to the ingest endpoint. Production uses
+/// `HTTPClient.sendPayload`; tests inject a recorder.
+typealias TracklessTransport = @Sendable (
+    _ endpoint: String,
+    _ apiKey: String,
+    _ payload: TracklessEventPayload,
+    _ timeoutSeconds: TimeInterval
+) async throws -> SendResult
+
 actor TracklessState {
 
     // Injected seams. `nonisolated let` because the lifecycle notification
@@ -265,11 +281,40 @@ actor TracklessState {
     // `acceptLifecycleSignal(at:)`).
     nonisolated let clock: TracklessClock
     nonisolated let notificationCenter: NotificationCenter
+    nonisolated let transport: TracklessTransport
 
-    init(clock: TracklessClock = SystemClock(), notificationCenter: NotificationCenter = .default) {
+    init(
+        clock: TracklessClock = SystemClock(),
+        notificationCenter: NotificationCenter = .default,
+        transport: @escaping TracklessTransport = { endpoint, apiKey, payload, timeoutSeconds in
+            try await HTTPClient.sendPayload(
+                endpoint: endpoint,
+                apiKey: apiKey,
+                payload: payload,
+                timeoutSeconds: timeoutSeconds
+            )
+        }
+    ) {
         self.clock = clock
         self.notificationCenter = notificationCenter
+        self.transport = transport
         self.session = SessionManager(clock: clock)
+    }
+
+    /// Everything one flush sends under, read in a single synchronous step.
+    ///
+    /// A flush suspends on every send, and a `configure()` can run in that gap.
+    /// Reading the key, endpoint and context once, up front, is what keeps a
+    /// batch drained under one configuration from going out under the next —
+    /// and it is how a re-`configure()` flushes the configuration it retires.
+    private struct FlushTarget {
+        let buffer: EventBuffer
+        let circuitBreaker: CircuitBreaker
+        let apiKey: String
+        let endpoint: String
+        let environment: TracklessEnvironment
+        let context: TracklessEventContext
+        let onError: (@Sendable (Error) -> Void)?
     }
 
     /// How long `applicationWillTerminate` may block the main thread waiting on
@@ -340,7 +385,46 @@ actor TracklessState {
         configured && !destroyed
     }
 
+    /// Apply a configuration.
+    ///
+    /// A first call (or the first after `destroy()`) starts a session. A repeat
+    /// call is one of two things:
+    ///
+    /// - **Identical settings** — an app calling `configure()` from a view or
+    ///   scene that re-runs. The session and buffer stay; only `onError` is
+    ///   replaced, since closures cannot be compared. Starting a new session
+    ///   here would inflate the session count.
+    /// - **Anything different** — typically a new API key when the user
+    ///   switches organization. The running session ends, and it and everything
+    ///   buffered under it are flushed under the *previous* key, endpoint,
+    ///   environment, context and circuit breaker; then a new session starts
+    ///   under the new settings exactly as a first call does.
+    ///
+    /// The previous configuration is captured and the new one installed with no
+    /// suspension point in between, so an event recorded while this method is
+    /// suspended always lands in the new buffer, under the new session. The
+    /// retired flush is awaited last, after the new session, timer and
+    /// observers are live: the actor is released while it waits on the network,
+    /// so nothing recorded meanwhile is delayed, dropped or misattributed.
     func configure(_ config: TracklessConfig) async {
+        let resolvedEnvironment = config.environment ?? Trackless.detectEnvironment()
+
+        var retired: (target: FlushTarget, session: SessionManager)?
+        if configured && !destroyed {
+            if hasSameSettings(config, environment: resolvedEnvironment) {
+                onError = config.onError
+                if debugLogging {
+                    logger.info("[Trackless] configure — settings unchanged, keeping the current session")
+                }
+                return
+            }
+            // A disabled configuration has nothing to report: its buffer was
+            // discarded, and its session must not send an end.
+            if enabled {
+                retired = (currentFlushTarget(), session)
+            }
+        }
+
         // Clean up previous state
         timerState.cancelTimer()
         idleTimerState.cancelTimer()
@@ -348,7 +432,7 @@ actor TracklessState {
 
         apiKey = config.apiKey
         endpoint = config.endpoint
-        environment = config.environment ?? Trackless.detectEnvironment()
+        environment = resolvedEnvironment
         onError = config.onError
         flushIntervalSeconds = config.flushIntervalSeconds
         debugLogging = config.debugLogging
@@ -387,6 +471,41 @@ actor TracklessState {
             startPeriodicFlush()
             addLifecycleObservers()
         }
+
+        if let retired {
+            if let result = await retired.session.end() {
+                _ = await retired.target.buffer.add(Self.sessionEndEvent(result))
+            }
+            await performFlush(retired.target)
+            if debugLogging {
+                logger.info("[Trackless] reconfigured — previous session ended and flushed under the previous settings")
+            }
+        }
+    }
+
+    /// Whether `config` matches the running configuration in every comparable
+    /// setting. `onError` is not compared: closures have no equality.
+    private func hasSameSettings(_ config: TracklessConfig, environment resolved: TracklessEnvironment) -> Bool {
+        config.apiKey == apiKey
+            && config.endpoint == endpoint
+            && resolved == environment
+            && config.enabled == enabled
+            && config.flushIntervalSeconds == flushIntervalSeconds
+            && config.debugLogging == debugLogging
+            && config.suppressWarnings == suppressWarnings
+            && config.sessionIdleTimeoutSeconds == sessionIdleTimeoutSeconds
+    }
+
+    private func currentFlushTarget() -> FlushTarget {
+        FlushTarget(
+            buffer: buffer,
+            circuitBreaker: circuitBreaker,
+            apiKey: apiKey,
+            endpoint: endpoint,
+            environment: environment,
+            context: context,
+            onError: onError
+        )
     }
 
     func recordEvent(type: TracklessEventType, name: String, detail: String? = nil) async {
@@ -521,13 +640,18 @@ actor TracklessState {
     }
 
     func flush() async {
-        await performFlush()
+        await performFlush(currentFlushTarget())
     }
 
     func setEnabled(_ enabled: Bool) async {
         self.enabled = enabled
         if !enabled {
+            // Drop the session rather than end it: an opt-out must not lead to a later send.
             await buffer.clear()
+            await session.destroy()
+            await funnels.clear()
+            await featureFirstUses.clear()
+            await errorFirstOccurrences.clear()
             timerState.cancelTimer()
             idleTimerState.cancelTimer()
             idleDeadline = nil
@@ -536,6 +660,7 @@ actor TracklessState {
             // Remove first: re-enabling twice would otherwise register a second
             // set of observers on top of the first.
             cleanupObserver()
+            await startNewSession()
             startPeriodicFlush()
             addLifecycleObservers()
         }
@@ -546,7 +671,7 @@ actor TracklessState {
         destroyed = true
 
         await endCurrentSession()
-        await performFlush()
+        await performFlush(currentFlushTarget())
 
         timerState.cancelTimer()
         idleTimerState.cancelTimer()
@@ -631,32 +756,43 @@ actor TracklessState {
         await funnels.clear()
         await featureFirstUses.clear()
         await errorFirstOccurrences.clear()
-        await addToBuffer(TracklessEvent(
+        await addToBuffer(Self.sessionEndEvent(result))
+    }
+
+    private static func sessionEndEvent(_ result: (duration: Int, depth: Int)) -> TracklessEvent {
+        TracklessEvent(
             type: .session,
             name: "end",
             stepIndex: result.depth,
             duration: Double(result.duration)
-        ))
+        )
     }
 
     private func checkFlushThreshold() async {
         let size = await buffer.totalSize
         if size >= bufferFlushThreshold {
-            await performFlush()
+            await performFlush(currentFlushTarget())
         }
     }
 
-    /// - Parameter timeoutSeconds: per-request timeout. The macOS termination
-    ///   path shortens it so the last send cannot outlive the quit budget that
-    ///   is blocking on it.
-    private func performFlush(timeoutSeconds: TimeInterval = HTTPClient.flushTimeoutSeconds) async {
-        let isEmpty = await buffer.isEmpty
+    /// - Parameters:
+    ///   - target: what to flush and what to send it under — normally
+    ///     `currentFlushTarget()`, read by the caller before its first
+    ///     suspension point; a re-`configure()` passes the retired one.
+    ///   - timeoutSeconds: per-request timeout. The macOS termination path
+    ///     shortens it so the last send cannot outlive the quit budget that is
+    ///     blocking on it.
+    private func performFlush(
+        _ target: FlushTarget,
+        timeoutSeconds: TimeInterval = HTTPClient.flushTimeoutSeconds
+    ) async {
+        let isEmpty = await target.buffer.isEmpty
         guard !isEmpty else { return }
 
-        let canAttempt = await circuitBreaker.canAttempt()
+        let canAttempt = await target.circuitBreaker.canAttempt()
         guard canAttempt else { return }
 
-        let payloads = await buffer.drain(environment: environment.rawValue, context: context)
+        let payloads = await target.buffer.drain(environment: target.environment.rawValue, context: target.context)
         guard !payloads.isEmpty else { return }
 
         // Enforce the server's request body size limit on each chunk before sending.
@@ -675,30 +811,25 @@ actor TracklessState {
 
         for payload in sizedPayloads {
             do {
-                let result = try await HTTPClient.sendPayload(
-                    endpoint: endpoint,
-                    apiKey: apiKey,
-                    payload: payload,
-                    timeoutSeconds: timeoutSeconds
-                )
+                let result = try await transport(target.endpoint, target.apiKey, payload, timeoutSeconds)
 
                 if result.status >= 500 {
-                    await circuitBreaker.recordFailure()
+                    await target.circuitBreaker.recordFailure()
                     warn("flush failed — HTTP \(result.status)")
-                    onError?(TracklessError.flushFailed(statusCode: result.status))
+                    target.onError?(TracklessError.flushFailed(statusCode: result.status))
                 } else if result.status >= 400 {
                     let bodyText = Self.parseResponseSummary(result.body)
                     warn("flush rejected — HTTP \(result.status) \(bodyText)")
-                    onError?(TracklessError.flushRejected(statusCode: result.status, body: bodyText))
+                    target.onError?(TracklessError.flushRejected(statusCode: result.status, body: bodyText))
                 } else {
-                    await circuitBreaker.recordSuccess()
+                    await target.circuitBreaker.recordSuccess()
                     if debugLogging {
                         logger.info("[Trackless] flush success — HTTP \(result.status)")
                     }
                 }
             } catch {
-                await circuitBreaker.recordFailure()
-                onError?(error)
+                await target.circuitBreaker.recordFailure()
+                target.onError?(error)
             }
         }
     }
@@ -847,7 +978,7 @@ actor TracklessState {
     func handleAppDidEnterBackground(at stamp: Date) async {
         guard canRecord(), acceptLifecycleSignal(at: stamp) else { return }
         await endCurrentSession()
-        await performFlush()
+        await performFlush(currentFlushTarget())
     }
 
     /// macOS: the app resigned active.
@@ -879,7 +1010,7 @@ actor TracklessState {
         if debugLogging {
             logger.info("[Trackless] resigned active — session ends in \(Int(self.sessionIdleTimeoutSeconds))s if still idle")
         }
-        await performFlush()
+        await performFlush(currentFlushTarget())
     }
 
     /// The app became active (macOS) or returned to the foreground (iOS).
@@ -900,12 +1031,11 @@ actor TracklessState {
     func handleAppDidBecomeActive(at stamp: Date) async {
         guard canRecord(), acceptLifecycleSignal(at: stamp) else { return }
 
-        // `setEnabled(false)` and a re-`configure()` close the window without
-        // ending the session, so the truncation mark can outlive `idleDeadline`.
-        // Rebuild the deadline from the mark in that case: with neither branch
-        // below running, the mark would stand and the session would later
-        // report a duration truncated at a resign it has long since recovered
-        // from.
+        // Defensive: a window closed without ending the session would leave
+        // the truncation mark outliving `idleDeadline`. Rebuild the deadline
+        // from the mark in that case: with neither branch below running, the
+        // mark would stand and the session would later report a duration
+        // truncated at a resign it has long since recovered from.
         let inactiveSince = await session.inactiveSince
         let deadline =
             idleDeadline ?? inactiveSince.map { $0.addingTimeInterval(sessionIdleTimeoutSeconds) }
@@ -1007,7 +1137,7 @@ actor TracklessState {
     private func endSessionForTermination() async {
         guard canRecord() else { return }
         await endCurrentSession()
-        await performFlush(timeoutSeconds: Self.terminationFlushTimeoutSeconds)
+        await performFlush(currentFlushTarget(), timeoutSeconds: Self.terminationFlushTimeoutSeconds)
     }
     #endif
 

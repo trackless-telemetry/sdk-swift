@@ -18,7 +18,7 @@ import UIKit
 enum ContextDetection {
 
     /// The version this build reports, without the platform prefix.
-    private static let version = "0.5.0"
+    private static let version = "0.5.1"
 
     /// The `platform` dimension for this build.
     ///
@@ -32,7 +32,7 @@ enum ContextDetection {
     static let platform = "ios"
     #endif
 
-    /// `<platform>/<version>`, e.g. `"macos/0.5.0"`. One Swift package publishes
+    /// `<platform>/<version>`, e.g. `"macos/0.5.1"`. One Swift package publishes
     /// both, so the version after the slash is the same on either platform.
     static let sdkVersion = "\(platform)/\(version)"
 

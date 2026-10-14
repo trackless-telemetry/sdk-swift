@@ -50,7 +50,7 @@ Trackless.view("settings_notifications")
 
 ### Call `configure()` exactly once at app launch
 
-In the `@main struct App { init() { ... } }` for SwiftUI, `application(_:didFinishLaunchingWithOptions:)` for UIKit, or `applicationDidFinishLaunching(_:)` for an AppKit `NSApplicationDelegate`. Never in view initializers, never on demand.
+In the `@main struct App { init() { ... } }` for SwiftUI, `application(_:didFinishLaunchingWithOptions:)` for UIKit, or `applicationDidFinishLaunching(_:)` for an AppKit `NSApplicationDelegate`. Never in view initializers, never on demand. The one legitimate repeat call is changing the API key at runtime — see §7.
 
 ## 1. Install
 
@@ -62,13 +62,13 @@ In the `@main struct App { init() { ... } }` for SwiftUI, `application(_:didFini
 https://github.com/trackless-telemetry/sdk-swift
 ```
 
-Select version `0.5.0` or later. Add `TracklessTelemetry` to your app target.
+Select version `0.5.1` or later. Add `TracklessTelemetry` to your app target.
 
 ### Swift Package Manager (Package.swift)
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/trackless-telemetry/sdk-swift", from: "0.5.0")
+    .package(url: "https://github.com/trackless-telemetry/sdk-swift", from: "0.5.1")
 ]
 ```
 
@@ -395,6 +395,45 @@ Each value's count then equals the number of sessions that reported it — 3,100
 
 **Do not share a name between `error(_:code:)` and `info(_:detail:)`.** They are stored in one place, distinguished only by level, and the session-reach marker dedups on the name alone — so a name used by both methods in one session is marked once and reads as two unrelated rows.
 
+#### Reporting the device model
+
+The SDK never reads the device model. Device class (phone, tablet, desktop) is the only hardware context it sends, and that does not change. If you want to know which models your app runs on, report the model yourself as an info value — it is your declaration, like a feature name, and it is counted the same way:
+
+```swift
+import Foundation
+
+/// "iPhone17,1" or "Mac15,3" — the name of a product line, not of one device.
+func hardwareModel() -> String {
+    #if targetEnvironment(simulator)
+    return "simulator"
+    #else
+    #if os(macOS)
+    let key = "hw.model"      // "Mac15,3"; hw.machine is only "arm64" on a Mac
+    #else
+    let key = "hw.machine"    // "iPhone17,1"
+    #endif
+    var size = 0
+    sysctlbyname(key, nil, &size, nil, 0)
+    var bytes = [UInt8](repeating: 0, count: size)
+    sysctlbyname(key, &bytes, &size, nil, 0)
+    return String(decoding: bytes.prefix(while: { $0 != 0 }), as: UTF8.self)
+    #endif
+}
+
+Trackless.configure(apiKey: "tl_your_api_key_here")
+Trackless.info("device_model", detail: hardwareModel())   // stored as "iphone17_1"
+```
+
+The dashboard's Info page then lists `device_model`, and its detail page shows sessions per model. Normalization turns `iPhone17,1` into `iphone17_1`; map identifiers to marketing names when you read the numbers, or in your own code before the call if you would rather see `iphone_16_pro`.
+
+Three things to know before you add it:
+
+- **A model is not a device identifier.** `iPhone17,1` names a product line that millions of devices share, which is why it is allowed. A serial number, a device name (`UIDevice.current.name`), an IDFV or anything else that names *one* device is a device identifier, and the [Terms](https://tracklesstelemetry.com/terms#acceptable-use) forbid putting one in any field.
+- **Each model is one value in your app's daily budget of unique names and values.** Apple's list is short enough that this does not matter. If you ever derive the value from something longer-tailed, collapse the rare ones to `other` first — see the Android guide's version of this recipe.
+- **It changes what your app reports, so check your own disclosures.** The Trackless privacy pages say the SDK does not collect the device model, and that stays true; your privacy policy should not repeat that sentence about your app once you send one. No privacy-manifest entry is needed for the `sysctlbyname` call — it is not a required-reason API — and the value falls under the *Other Diagnostic Data* row you already declare for info events.
+
+Like every info value, a model's count can be filtered by the other dimensions (region, language, OS version). In a small app a rare model in a small country can be a very small number of sessions. That is the reason the SDK does not send the model for you.
+
 #### Migrating from the `severity` parameter
 
 `error(_:severity:code:)` still compiles and still records — the parameter is deprecated, not removed, so no published call breaks. The SDK maps what you pass to one of two stored levels before the event is buffered:
@@ -474,6 +513,7 @@ A session's boundaries differ by platform, because "the user stopped using the a
 
 - **Depth:** Session depth is **events per session**. Every non-session event increments it — views, features, funnel steps, performance measurements, errors and `info()` calls alike
 - **Duration:** Measured on the wall clock and clamped, so a clock change (NTP, time zone, manual adjustment) cannot produce a negative duration or one lasting a year
+- **Reconfiguring:** calling `configure()` again with any setting changed ends the session and starts a new one; calling it again with identical settings keeps the running session (§7)
 
 ### iOS
 
@@ -492,7 +532,7 @@ A Mac app is not backgrounded when you switch away from it — it keeps running,
 - **Duration excludes the idle time.** It is truncated at the moment the app resigned active, never extended to the timeout boundary — so the number measures use, not the value of a config knob, and does not shift if you change that value
 - **Sleep:** a Mac that sleeps for an hour has been idle for an hour, and the idle window is wall-clock so it ends the session accordingly. Sleep is normally excluded from the duration too, but indirectly: the duration truncates when the app resigns active, and going to sleep resigns the frontmost app to the login window under the default "require password after sleep" setting. With that setting off and the app frontmost, the sleep counts as session time
 
-**Menu-bar and accessory apps (`LSUIElement`):** an app that never becomes active never resigns active either, so no idle window ever opens and the session runs for the lifetime of the process. If that is your app, end sessions yourself — call `await Trackless.destroy()` when the app quits, or re-`configure()` at a boundary that means something in your product.
+**Menu-bar and accessory apps (`LSUIElement`):** an app that never becomes active never resigns active either, so no idle window ever opens and the session runs for the lifetime of the process. If that is your app, end sessions yourself — call `await Trackless.destroy()` when the app quits. A repeat `configure()` with identical settings does not end a session.
 
 ### 5.1 macOS setup — two things that are not automatic
 
@@ -530,17 +570,27 @@ if await Trackless.isConfigured {
 }
 
 // Disable recording (e.g., user opts out)
-Trackless.setEnabled(false)   // Discards buffer, stops timers
+Trackless.setEnabled(false)   // Discards buffer and session, stops timers
 
 // Re-enable recording
-Trackless.setEnabled(true)    // Resumes from empty buffer
+Trackless.setEnabled(true)    // Resumes with a new session
 
 // Force flush
 await Trackless.flush()
 
 // Permanent shutdown
-await Trackless.destroy()     // Flushes remaining events, then disables permanently
+await Trackless.destroy()     // Ends the session and sends remaining events; stops until configure()
 ```
+
+### Changing the API key at runtime
+
+Keep calling `configure()` once at launch. When the key has to change while the app is running — a user switching organization, say — call it again with the new key:
+
+```swift
+Trackless.configure(apiKey: newOrganizationKey)
+```
+
+The current session ends, and its buffered events (including the session end) are sent under the previous key, endpoint and environment. A new session then starts under the new settings, exactly as at launch. A repeat call with identical settings is a no-op: it keeps the running session and buffer and only replaces `onError`, so a `configure()` that re-runs with the same arguments does not inflate session counts.
 
 ## 8. Complete Integration Example
 
@@ -703,7 +753,7 @@ struct SettingsView: View {
 Trackless collects **no user identifiers** and stores **only aggregate counts**:
 
 - **No IDFA or IDFV** — no App Tracking Transparency prompt needed
-- **No device name, model, or hardware identifiers**
+- **No device name, model, or hardware identifiers** — the SDK reads none of them. A model reaches Trackless only if you report one yourself as an info value ([Reporting the device model](#reporting-the-device-model))
 - **No IP address processing by application code** — IP addresses are never read, parsed, stored, or used by the SDK or the Trackless backend. Region comes from system locale, not IP geolocation. (AWS infrastructure receives IP addresses for network routing and DDoS protection as part of standard cloud operations, but they are not used for analytics.)
 - **No persistent storage** — no UserDefaults, Keychain, files, or Core Data
 - **Nothing about this installation** — no install date, no install source, no App Store receipt, no file timestamps. The SDK stores nothing on the device and reads nothing stored there
@@ -713,7 +763,7 @@ Trackless collects **no user identifiers** and stores **only aggregate counts**:
 - **No individual performance measurements stored** — durations are aggregated server-side into statistical digests (t-digest)
 - **PII auto-stripping** — email addresses, phone numbers, and SSN patterns are automatically stripped from all event fields before buffering
 
-The only context collected is: platform (`"ios"`, or `"macos"` on a native AppKit build), OS version (major only, e.g., `"17"`), device class (phone/tablet/desktop), region (two-letter country code from `Locale.current`, e.g., `"US"`), language (ISO 639-1 code from `Locale.current`, e.g., `"en"`), app version, build number, and `sdkVersion` (automatically included, e.g., `"ios/0.5.0"` or `"macos/0.5.0"`). All are coarse, non-identifying dimensions.
+The only context collected is: platform (`"ios"`, or `"macos"` on a native AppKit build), OS version (major only, e.g., `"17"`), device class (phone/tablet/desktop), region (two-letter country code from `Locale.current`, e.g., `"US"`), language (ISO 639-1 code from `Locale.current`, e.g., `"en"`), app version, build number, and `sdkVersion` (automatically included, e.g., `"ios/0.5.1"` or `"macos/0.5.1"`). All are coarse, non-identifying dimensions.
 
 Every one of them is either a runtime property the OS exposes to every app (OS version, device class, locale, language) or a constant compiled into your app (version, build number, the `DEBUG` flag). Because the SDK reads no App Store receipt, a release build cannot tell an App Store install from TestFlight or a direct download; it sends no distribution channel at all.
 
