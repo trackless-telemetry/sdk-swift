@@ -75,7 +75,7 @@ Or add it to your `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/trackless-telemetry/sdk-swift", from: "0.5.1")
+    .package(url: "https://github.com/trackless-telemetry/sdk-swift", from: "0.6.0")
 ]
 ```
 
@@ -124,9 +124,15 @@ Trackless.configure(
     flushIntervalSeconds: 60,              // Optional — how often buffered events are sent
     debugLogging: false,                   // Optional — enable debug logging for happy-path events
     suppressWarnings: false,               // Optional — suppress warning and error logging
-    sessionIdleTimeoutSeconds: 300         // Optional — macOS only; how long inactive before the session ends
+    sessionIdleTimeoutSeconds: 300,        // Optional — macOS only; how long inactive before the session ends
+    measureLaunch: true,                   // Optional — send trackless.launch once per process (off by default)
+    launchThresholdSeconds: 2.0,           // Optional — threshold for trackless.launch
+    detectHangs: true,                     // Optional — send trackless.hang for each hang of 250 ms or more (off by default)
+    captureUncaught: true                  // Optional — count uncaught NSExceptions as trackless.uncaught (off by default)
 )
 ```
+
+`measureLaunch`, `detectHangs` and `captureUncaught` are **off by default** because each changes your App Store privacy label (see [App Store Privacy Labels](#app-store-privacy-labels)); [GUIDE.md](GUIDE.md) defines what each measures and what it misses.
 
 **Environment auto-detection:** Debug builds automatically use `.sandbox`, release builds use `.production`. Override by passing `environment:` explicitly.
 
@@ -144,6 +150,12 @@ All methods are static, non-blocking, non-throwing, and safe to call from any th
 | `Trackless.performance(_ name: String, durationSeconds: Double, thresholdSeconds: Double?)` | Timing measurement (seconds) |
 | `Trackless.error(_ name: String, code: String?)` | Something went wrong — counts toward errors per session and every alert |
 | `Trackless.info(_ name: String, detail: String?)` | Something worth counting that the user did not do and that did not go wrong — never counts toward errors or alerts |
+| `Trackless.startTimer(_ name: String)` | Start a timer; starting an open name restarts it (at most 50 open) |
+| `Trackless.stopTimer(_ name: String, thresholdSeconds: Double?)` | Stop it and send the elapsed seconds as `performance()`; nothing if no timer is open |
+| `Trackless.cancelTimer(_ name: String)` | Drop it and send nothing |
+| `Trackless.measure(_ name: String, thresholdSeconds: Double?, _ body:)` | Time a sync or `async` closure and return its result; sends only when it returns normally |
+
+Session end discards every open timer, so a timer never measures time the app was in the background.
 
 ### Control Methods
 
@@ -188,7 +200,7 @@ All event fields (`name`, `detail`, `step`, `code`) are automatically normalized
 - **Auto-lowercase:** fields are lowercased (`Export_Clicked` → `export_clicked`)
 - **Trim/collapse:** leading/trailing `_`/`.` trimmed, consecutive dots collapsed
 - **Truncate:** fields are truncated to 100 characters
-- **No identifiers:** UUIDs, long hex strings, and long numeric strings are rejected
+- **No identifiers:** a UUID or 24+ hex characters anywhere in a field, and long hex-only or numeric-only values, are rejected
 - **PII stripping:** emails, phone numbers, and SSN patterns are stripped from all fields
 
 ## How It Works
@@ -213,7 +225,7 @@ The SDK captures a small set of **coarse, non-identifying** dimensions:
 | `language` | `"en"` | `Locale.current` (ISO 639-1 code) |
 | `appVersion` | `"2.1.0"` | `Bundle.main` |
 | `buildNumber` | `"142"` | `Bundle.main` |
-| `sdkVersion` | `"ios/0.5.1"`, `"macos/0.5.1"` | SDK platform and version identifier |
+| `sdkVersion` | `"ios/0.6.0"`, `"macos/0.6.0"` | SDK platform and version identifier |
 
 **The SDK stores nothing on the device and reads nothing stored there.** It uses only runtime properties the OS exposes to every app (OS version, device class, locale, language) and constants compiled into your app (version, build number, the `DEBUG` flag). It reads no App Store receipt, no file timestamps, no install date and no install source. The `DEBUG` flag decides only `environment`.
 
@@ -226,23 +238,28 @@ The SDK captures a small set of **coarse, non-identifying** dimensions:
 - No install date, install source, App Store receipt, or file timestamps — nothing the OS or the App Store keeps about this installation
 - No cross-session linking of any kind
 - No data sent to third parties
-- No stack traces, crash logs, or error messages — error and info tracking uses only developer-defined names and codes
-- No individual performance measurements stored — durations are aggregated into statistical digests
+- No stack traces, crash logs, or error messages — error and info tracking uses only developer-defined names and codes; with `captureUncaught` on, the SDK adds a count of uncaught exceptions by name, and nothing else about them
+- No performance measurement stored as its own record — durations are aggregated into statistical digests, though a row with very few samples approximates their values
 - PII auto-stripping of email addresses, phone numbers, and SSN patterns from all event fields
 
 ## App Store Privacy Labels
 
 When submitting to the App Store, declare the following in App Store Connect's Privacy section (all marked **Not Linked to User Identity** and **Not Used for Tracking**):
 
-- **Usage Data — Product Interaction** (feature counts, view counts, funnel steps)
-- **Diagnostics — Other Diagnostic Data** (error and info events: name, level, code). **Not Crash Data** — the SDK captures no crashes and no stack traces; `error()` is called by your code, not by a crash handler
-- **Diagnostics — Performance Data** (performance events: metric name, duration digest — no individual measurements)
+| Category | Data Type | Why |
+|----------|-----------|-----|
+| Usage Data | Product Interaction | Feature counts, view counts, funnel steps |
+| Diagnostics | Other Diagnostic Data | Error and info events (name, level, code). Not *Crash Data* unless `captureUncaught` is on |
+| Diagnostics | Crash Data | **Only when `captureUncaught` is on**: a count of uncaught exceptions by name (`trackless.uncaught`), with no reason, call stack or `userInfo` |
+| Diagnostics | Performance Data | Performance metrics you send (a duration digest, not individual records; a row with very few samples approximates their values) |
+| Diagnostics | Performance Data | **When `measureLaunch` is on:** `trackless.launch`, seconds from `configure()` to the app's first activation. Declare Performance Data even if your app sends no metrics of its own |
+| Diagnostics | Performance Data | **When `detectHangs` is on:** `trackless.hang`, seconds the main thread was unresponsive, per hang of 250 ms or more. Not *Crash Data* |
 
 ATT is **not required**. See the [full guidance](https://github.com/trackless-telemetry/platform/blob/main/docs/requirements/sdks.md#227-app-store-privacy-compliance-guidance) for details.
 
 ### Privacy manifest
 
-The package ships `Sources/TracklessTelemetry/PrivacyInfo.xcprivacy`, so you do not have to declare the SDK's API use yourself. It declares `NSPrivacyTracking: false`, no tracking domains, the three data types above (all **Not Linked**, **Not Used for Tracking**), and **no required-reason APIs** (`NSPrivacyAccessedAPITypes` is empty). No file timestamps, no `UserDefaults`, no system boot time, no disk space, no active keyboards — the SDK uses none of them.
+The package ships `Sources/TracklessTelemetry/PrivacyInfo.xcprivacy`, so you do not have to declare the SDK's API use yourself. It declares `NSPrivacyTracking: false`, no tracking domains, the four data types above (all **Not Linked**, **Not Used for Tracking**), and **no required-reason APIs** (`NSPrivacyAccessedAPITypes` is empty). No file timestamps, no `UserDefaults`, no system boot time, no disk space, no active keyboards — the SDK uses none of them.
 
 Keep this section and the manifest in agreement: if one changes, so does the other.
 

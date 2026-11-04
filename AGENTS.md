@@ -47,13 +47,22 @@ Trackless.configure(
     flushIntervalSeconds: TimeInterval = 60,
     debugLogging: Bool = false,
     suppressWarnings: Bool = false,
-    sessionIdleTimeoutSeconds: TimeInterval = 300      // macOS only; clamped to 30...3600
+    sessionIdleTimeoutSeconds: TimeInterval = 300,     // macOS only; clamped to 30...3600
+    measureLaunch: Bool = false,                       // opt-in: trackless.launch once per process
+    launchThresholdSeconds: Double? = nil,             // threshold for trackless.launch
+    detectHangs: Bool = false,                         // opt-in: trackless.hang per hang ≥ 250 ms
+    captureUncaught: Bool = false                      // opt-in: trackless.uncaught per uncaught NSException
 )
 Trackless.isConfigured: Bool                           // static property
 Trackless.view(_ name: String, detail: String? = nil)
 Trackless.feature(_ name: String, detail: String? = nil)
 Trackless.funnel(_ funnelName: String, stepIndex: Int, step stepName: String)
 Trackless.performance(_ name: String, durationSeconds: Double, thresholdSeconds: Double? = nil)
+Trackless.startTimer(_ name: String)
+Trackless.stopTimer(_ name: String, thresholdSeconds: Double? = nil)   // sends performance(); no-op if not open
+Trackless.cancelTimer(_ name: String)                                  // drops it, sends nothing
+Trackless.measure<T>(_ name: String, thresholdSeconds: Double? = nil, _ body: () throws -> T) rethrows -> T
+Trackless.measure<T>(_ name: String, thresholdSeconds: Double? = nil, _ body: () async throws -> T) async rethrows -> T
 Trackless.error(_ name: String, code: String? = nil)
 Trackless.info(_ name: String, detail: String? = nil)
 Trackless.flush() async
@@ -62,6 +71,35 @@ Trackless.destroy() async
 ```
 
 `TracklessEnvironment`: `.sandbox`, `.production`.
+
+## Launch time and hangs (opt-in)
+
+- `measureLaunch: true` sends `trackless.launch` once per process: seconds from the
+  `configure()` call to the first `didBecomeActive`. It is measured from `configure()`, not
+  process start, so `configure()` must run at launch (rule 3); a `configure()` after the app is
+  already active sends no launch time. A launch longer than 60 seconds is dropped, which also
+  leaves out a background launch (silent push, background refresh) opened later; one opened
+  within 60 seconds still counts. Do not hand-roll an `app_launch` metric alongside it.
+- `detectHangs: true` sends one `trackless.hang` sample (seconds) for each main-thread hang of
+  250 ms or more, from a watchdog that runs only while the app is active.
+- Both are **off by default**. Turning either on sends performance data: the app must declare
+  **Diagnostics → Performance Data** on its App Store privacy label. Say so to the developer
+  when you turn one on.
+- Names starting with `trackless.` are reserved for what the SDK sends itself. Never pass one
+  to `performance()`, `startTimer`, `measure`, `error()` or `info()` (the SDK warns once and
+  sends it anyway).
+
+## Uncaught exceptions (opt-in)
+
+- `captureUncaught: true` counts each `NSException` the app did not catch as
+  `error("trackless.uncaught", code: <exception name>)`, sent with the session's end before the
+  process exits (at most 1.5 s), then handed on to the previously installed handler, so a
+  crash reporter keeps working. Only the exception's name is read.
+- **Most Swift crashes are not counted:** force-unwrap, `fatalError` and index out of range are
+  signals, not exceptions. On macOS, AppKit swallows exceptions raised during event handling.
+  Never describe the count as a crash rate.
+- **Off by default.** Turning it on means declaring **Diagnostics → Crash Data** on the App
+  Store privacy label. Say so to the developer when you turn it on.
 
 ## Errors and info
 
@@ -88,7 +126,9 @@ Trackless.destroy() async
 - Store the API key (`tl_` prefix) in xcconfig or Info.plist, not hardcoded in committed source.
 - Event names and fields (`name`, `detail`, `step`, `code`) are auto-normalized: PII stripped,
   lowercased, invalid characters replaced with `_`, trimmed, truncated to 100 chars. Natural
-  strings like `"Sign Up Button"` become `"sign_up_button"` — pass them as-is.
+  strings like `"Sign Up Button"` become `"sign_up_button"` — pass them as-is. A field containing
+  a UUID or a long hex ID is rejected whole, even with a prefix (`user-<uuid>`), so never build a
+  field from an identifier.
 - `performance()` takes **seconds**, not milliseconds.
 - Environment auto-detects when not passed: DEBUG builds → `.sandbox`, Release → `.production`.
 - App version and build number are auto-read from `Bundle.main`.

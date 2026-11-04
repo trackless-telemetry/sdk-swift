@@ -32,7 +32,7 @@ public enum TracklessErrorSeverity: String, Codable, Sendable {
     case warning
     /// The level `Trackless.error(_:code:)` sends.
     case error
-    @available(*, deprecated, message: "Nothing reads `fatal` — it is sent as `error`, and no SDK captures crashes. Call Trackless.error(_:code:) instead.")
+    @available(*, deprecated, message: "Nothing reads `fatal` — it is sent as `error`. Uncaught exceptions are counted only by configure(captureUncaught: true), as trackless.uncaught. Call Trackless.error(_:code:) instead.")
     case fatal
 }
 

@@ -62,13 +62,13 @@ In the `@main struct App { init() { ... } }` for SwiftUI, `application(_:didFini
 https://github.com/trackless-telemetry/sdk-swift
 ```
 
-Select version `0.5.1` or later. Add `TracklessTelemetry` to your app target.
+Select version `0.6.0` or later. Add `TracklessTelemetry` to your app target.
 
 ### Swift Package Manager (Package.swift)
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/trackless-telemetry/sdk-swift", from: "0.5.1")
+    .package(url: "https://github.com/trackless-telemetry/sdk-swift", from: "0.6.0")
 ]
 ```
 
@@ -174,7 +174,11 @@ Trackless.configure(
     flushIntervalSeconds: 60,              // Optional — how often buffered events are sent
     debugLogging: true,                    // Optional — enable debug logging for happy-path events
     suppressWarnings: false,               // Optional — suppress warning and error logging
-    sessionIdleTimeoutSeconds: 300         // Optional — macOS only; inactivity before the session ends
+    sessionIdleTimeoutSeconds: 300,        // Optional — macOS only; inactivity before the session ends
+    measureLaunch: true,                   // Optional — send trackless.launch once per launch (off by default)
+    launchThresholdSeconds: 2.0,           // Optional — threshold for trackless.launch
+    detectHangs: true,                     // Optional — send trackless.hang for each hang ≥ 250 ms (off by default)
+    captureUncaught: true                  // Optional — count uncaught NSExceptions as trackless.uncaught (off by default)
 )
 ```
 
@@ -189,6 +193,12 @@ Trackless.configure(
 | `debugLogging`          | `Bool`                                | `false`                                | Enable debug logging for happy-path events    |
 | `suppressWarnings`      | `Bool`                                | `false`                                | Suppress warning and error logging            |
 | `sessionIdleTimeoutSeconds` | `TimeInterval`                    | `300`                                  | **macOS only** — inactivity before the session ends. Clamped to 30–3600s, with one warning when it is. Ignored on iOS, where a session ends at background |
+| `measureLaunch`         | `Bool`                                | `false`                                | Send the launch time as `trackless.launch`, once per process — see [Launch time and hangs](#launch-time-and-hangs-opt-in) |
+| `launchThresholdSeconds` | `Double?`                            | `nil`                                  | Threshold for `trackless.launch`. A value that is not a positive number is ignored, with a warning |
+| `detectHangs`           | `Bool`                                | `false`                                | Send each main-thread hang of 250 ms or more as `trackless.hang` — see [Launch time and hangs](#launch-time-and-hangs-opt-in) |
+| `captureUncaught`       | `Bool`                                | `false`                                | Count each `NSException` the app did not catch as `error("trackless.uncaught", code: <exception name>)` — see [Uncaught exceptions](#uncaught-exceptions-opt-in) |
+
+Changing `measureLaunch`, `launchThresholdSeconds`, `detectHangs` or `captureUncaught` in a repeat `configure()` counts as changed settings, like any other option: the current session ends and a new one starts.
 
 **Environment auto-detection:** In `DEBUG` builds, environment defaults to `.sandbox`. In release builds, it defaults to `.production`. Override by passing `environment:` explicitly.
 
@@ -332,18 +342,76 @@ let start = CFAbsoluteTimeGetCurrent()
 let processed = processImage(original)
 Trackless.performance("image_processing", durationSeconds: CFAbsoluteTimeGetCurrent() - start)
 
-// App launch time (measure in didFinishLaunchingWithOptions or App.init)
-Trackless.performance("app_launch", durationSeconds: launchDuration)
-
 // With threshold — track how many measurements exceed 2 seconds
 Trackless.performance("api_user_profile", durationSeconds: elapsed, thresholdSeconds: 2.0)
 ```
 
-**When to use:** API latency, image processing time, database query time, app launch time — any timing you want percentile distributions for (p50/p90/p99).
+**When to use:** API latency, image processing time, database query time — any timing you want percentile distributions for (p50/p90/p99). For launch time and main-thread hangs, turn on the SDK's own metrics instead of timing them yourself ([Launch time and hangs](#launch-time-and-hangs-opt-in)).
+
+**Reserved names:** names starting with `trackless.` are reserved for what the SDK sends itself. `performance()`, `startTimer` and `measure` log a warning once per process when given one, and send it anyway.
 
 **Threshold:** The optional `threshold` parameter defines a performance threshold in seconds. Each name/threshold combination is tracked separately, with breach counts shown in the dashboard.
 
 **Important:** Duration is in **seconds** (not milliseconds). Threshold must be > 0.
+
+#### Timers and `measure`
+
+When the start and end of an operation are in different places, let the SDK keep the clock:
+
+```swift
+Trackless.startTimer("checkout")
+// ... later, anywhere in the app
+Trackless.stopTimer("checkout", thresholdSeconds: 2.0)   // sends performance("checkout", elapsed, 2.0)
+Trackless.cancelTimer("checkout")                         // abandoned — drops it, sends nothing
+```
+
+When the operation is one closure, `measure` times it and returns its result:
+
+```swift
+let rows = try Trackless.measure("csv_parse", thresholdSeconds: 0.5) {
+    try parser.parse(file)
+}
+
+let feed = try await Trackless.measure("feed_load", thresholdSeconds: 2.0) {
+    try await api.fetchFeed()
+}
+```
+
+- The name is normalized at `startTimer`, like every event name, so `stopTimer("Checkout")` closes `startTimer("checkout")`.
+- `stopTimer` for a name with no open timer does nothing. Starting a name that is already open restarts it.
+- At most **50** timers are open at once; a start past that is ignored, with one warning per session.
+- **Session end discards every open timer** (background on iOS, the idle timeout on macOS), as do `setEnabled(false)`, a `configure()` with changed settings and `destroy()`. A timer never measures time the app was not running, so a `stopTimer` after the user backgrounded mid-checkout sends nothing.
+- `measure` sends only when the closure **returns normally**: if it throws, nothing is sent and the error is rethrown. It sends nothing if the session ended while the closure ran. It does not count toward the 50-timer cap.
+- Elapsed time is wall-clock time (`Date()`), the clock the session already reads; the SDK reads no boot-time API. An elapsed time below zero or above a day means the clock changed while the timer ran, and is dropped.
+- Timers live in memory only and are never written to disk.
+
+#### Launch time and hangs (opt-in)
+
+Two metrics the SDK can measure for you. Both are **off by default**; turn them on in `configure()`:
+
+```swift
+Trackless.configure(
+    apiKey: "tl_your_api_key_here",
+    measureLaunch: true,             // trackless.launch
+    launchThresholdSeconds: 2.0,     // optional threshold for it
+    detectHangs: true                // trackless.hang
+)
+```
+
+| Metric | What one sample is | Threshold |
+|--------|--------------------|-----------|
+| `trackless.launch` | Seconds from the `configure()` call to the app's first `didBecomeActive` (`UIApplication.didBecomeActiveNotification` on iOS, `NSApplication.didBecomeActiveNotification` on macOS). Sent once per process | `launchThresholdSeconds`, when set |
+| `trackless.hang` | Seconds the main thread was unresponsive, for each hang of **250 ms or more** (Apple's definition of a hang), sent when the main thread recovers | None — every sample is already over 250 ms |
+
+- **Launch is measured from `configure()`, not process start.** Reading the process start time would mean reading process metadata (`sysctl`), which the SDK does not do. Call `configure()` as early as you can — in `App.init` or `application(_:didFinishLaunchingWithOptions:)` — and the metric covers everything from there to the app's first activation (`didBecomeActive`), which is close to, but not the same as, its first frame.
+- **One launch per process, the first activation only.** Returning from the background is not a launch. A `configure()` that runs after the app is already active (called late, from a view's `onAppear`, say) sends **no** launch time for that process. A launch measured while recording is disabled is not sent.
+- **A launch longer than 60 seconds is dropped, not clipped.** Nothing is sent for that process. This cap is also what leaves out a process the system launched in the background (background fetch, a silent push): iOS suspends it within about 30 seconds, so when the user opens it later the first activation comes more than 60 seconds after `configure()`. A background launch the user opens within 60 seconds still counts, and includes the time it spent in the background. The SDK does not read `applicationState` to tell the two apart: with UIScene and SwiftUI lifecycles it is not a dependable signal at `configure()`, and macOS apps are routinely inactive at launch.
+- **The hang watchdog runs only while the app is active.** Every 250 ms a background thread posts a no-op to the main queue and measures how long it waited. It stops at resign-active and background, so it costs nothing while the app is not on screen, and starts again when the app is active. It never blocks the main thread. A debugger pause looks like a hang, but debug builds report as `sandbox`, so it never reaches production numbers.
+- Both read the same wall clock (`Date()`) as sessions and timers — no boot-time API, no required-reason API, nothing stored on the device and nothing about earlier launches. A negative launch (the clock changed) is dropped, as is a hang outside 0 to 86,400 seconds.
+- Neither counts toward the session's depth: they describe the app, not something the user did.
+- Each platform measures launch its own way, and the performance page merges every platform unless you filter it, so filter by platform before comparing launch times.
+
+**Opting in means declaring Performance Data.** An app that never called `performance()` has not declared **Diagnostics → Performance Data** on its App Store privacy label. Turning on `measureLaunch` or `detectHangs` sends performance metrics, so add that row ([App Store Privacy Labels](#app-store-privacy-labels)) before you ship it. That is why both are off by default.
 
 ### Errors
 
@@ -368,6 +436,30 @@ do {
 **When to use:** Caught exceptions, failed network requests, validation errors — any error you want to trend over time. Every `error()` call counts toward errors per session and toward every alert.
 
 **Session reach (automatic):** The first time each name occurs in a session, the SDK marks it so the dashboard can report *session reach* — the share of sessions that reported it at least once — alongside raw counts. This is fully automatic; keep calling `error(...)` normally. Reach dedups on the **name**, so the same error reported with several `code:` values in one session still counts once. The tracking is in-memory only and resets when the session ends — no identifiers, no persistence.
+
+**Reserved names:** names starting with `trackless.` are reserved for what the SDK sends itself (`trackless.uncaught`). `error()` and `info()` log a warning once per process when given one, and send it anyway.
+
+#### Uncaught exceptions (opt-in)
+
+The SDK can count the exceptions your app did not catch, by exception name. **Off by default**; turn it on in `configure()`:
+
+```swift
+Trackless.configure(
+    apiKey: "tl_your_api_key_here",
+    captureUncaught: true            // trackless.uncaught
+)
+```
+
+Each uncaught `NSException` is sent as an ordinary error event, `error("trackless.uncaught", code: <exception name>)`, with the code normalized like any other (`NSInvalidArgumentException` arrives as `nsinvalidargumentexception`; a name normalization rejects arrives as `unknown`). It counts toward errors per session and toward every alert, like any `error()`.
+
+- **What it catches:** exceptions that reach `NSSetUncaughtExceptionHandler`. The SDK chains to the handler that was installed before it (`NSGetUncaughtExceptionHandler()`, typically a crash reporter's) and always calls it afterwards, so a crash reporter keeps working.
+- **What it does not catch — most Swift crashes.** Force-unwrapping `nil`, `fatalError`, an array index out of range and the other Swift runtime traps are signals, not exceptions, and never reach the handler. A Swift-first app will see few counts; that does not mean it crashes rarely. **On macOS**, AppKit catches exceptions raised during event handling and logs them, so those never reach the handler either.
+- **Only the exception's name is read.** No reason, no `userInfo`, no call stack, no file or line.
+- **Sent now or never.** Nothing is written to disk for a later launch. The handler sends the uncaught event and the session's end (its duration and depth) in one request, waits for it **at most 1.5 seconds**, then hands the exception on. Other events still buffered at that moment are lost, as they are on any crash.
+- **It leaves the session's depth alone.** The depth sent with the session's end counts the events your code recorded; the uncaught event is not added to it, just as `trackless.launch` and `trackless.hang` are not.
+- `setEnabled(false)`, `destroy()` or a `configure()` that turns the option off make the handler pass the exception straight on and send nothing. The handler, once installed, stays installed for the life of the process, so a library that installed its own handler after the SDK keeps its chain.
+
+**Opting in means declaring Crash Data.** A count of uncaught exceptions is a count of crashes, so an app that turns on `captureUncaught` must declare **Diagnostics → Crash Data** on its App Store privacy label (Not Linked to You, Not Used for Tracking). That is why it is off by default.
 
 ### Info
 
@@ -456,12 +548,14 @@ All event fields (`name`, `detail`, `step`, `code`) are automatically normalized
 | **Trim** | Leading/trailing underscores and dots are removed — `...foo...` becomes `foo` |
 | **Collapse dots** | Consecutive dots are collapsed — `foo..bar` becomes `foo.bar` |
 | **Truncate** | Truncated to 100 characters |
-| **No identifiers** | UUIDs, long hex strings, and numeric-only strings >12 chars are rejected |
+| **No identifiers** | A UUID or 24+ hex characters anywhere in a field, a hex-only value >16 chars, and a numeric-only value >12 chars are rejected, checked before PII stripping as well as after |
 | **PII stripping** | Emails, phone numbers, and SSN patterns are stripped from all fields |
 
 **Valid characters after normalization:** Lowercase `a-z`, digits `0-9`, underscores `_`, hyphens `-`, dots `.`
 
 **Examples:** `"Sign Up Button"` → `"sign_up_button"`, `"ERR_001"` → `"err_001"`, `"Export!Clicked"` → `"export_clicked"`, `"Settings.Theme"` → `"settings.theme"`
+
+**Reserved prefix:** names starting with `trackless.` belong to what the SDK sends itself (`trackless.launch`, `trackless.hang`, `trackless.uncaught`). Passing one to `performance()`, `startTimer`, `measure`, `error()` or `info()` logs a warning once per process; it is still sent.
 
 ### Feature Grouping with Detail
 
@@ -759,11 +853,11 @@ Trackless collects **no user identifiers** and stores **only aggregate counts**:
 - **Nothing about this installation** — no install date, no install source, no App Store receipt, no file timestamps. The SDK stores nothing on the device and reads nothing stored there
 - **No cross-session linking** — session state is in-memory only
 - **No data sent to third parties** — events go only to your configured endpoint
-- **No stack traces, crash logs, or error messages** — error and info tracking uses only developer-defined names and codes
-- **No individual performance measurements stored** — durations are aggregated server-side into statistical digests (t-digest)
+- **No stack traces or error messages** — error and info tracking uses only developer-defined names and codes; with `captureUncaught` on, the SDK adds a count of uncaught exceptions by name, and nothing else about them
+- **No performance measurement stored as its own record** — durations are aggregated server-side into statistical digests (t-digest); a row with very few samples approximates their values
 - **PII auto-stripping** — email addresses, phone numbers, and SSN patterns are automatically stripped from all event fields before buffering
 
-The only context collected is: platform (`"ios"`, or `"macos"` on a native AppKit build), OS version (major only, e.g., `"17"`), device class (phone/tablet/desktop), region (two-letter country code from `Locale.current`, e.g., `"US"`), language (ISO 639-1 code from `Locale.current`, e.g., `"en"`), app version, build number, and `sdkVersion` (automatically included, e.g., `"ios/0.5.1"` or `"macos/0.5.1"`). All are coarse, non-identifying dimensions.
+The only context collected is: platform (`"ios"`, or `"macos"` on a native AppKit build), OS version (major only, e.g., `"17"`), device class (phone/tablet/desktop), region (two-letter country code from `Locale.current`, e.g., `"US"`), language (ISO 639-1 code from `Locale.current`, e.g., `"en"`), app version, build number, and `sdkVersion` (automatically included, e.g., `"ios/0.6.0"` or `"macos/0.6.0"`). All are coarse, non-identifying dimensions.
 
 Every one of them is either a runtime property the OS exposes to every app (OS version, device class, locale, language) or a constant compiled into your app (version, build number, the `DEBUG` flag). Because the SDK reads no App Store receipt, a release build cannot tell an App Store install from TestFlight or a direct download; it sends no distribution channel at all.
 
@@ -772,7 +866,7 @@ Every one of them is either a runtime property the OS exposes to every app (OS v
 The package ships `Sources/TracklessTelemetry/PrivacyInfo.xcprivacy` as a target resource, so you do not declare the SDK's API use in your own app's manifest. It declares:
 
 - `NSPrivacyTracking: false` and an empty `NSPrivacyTrackingDomains` — the SDK does no tracking as Apple defines it: no IDFA, no linking to identity, no data brokers
-- The three collected data types from the privacy-label table below, each **Not Linked to User Identity** and **Not Used for Tracking**, for Analytics and App Functionality
+- The four collected data types from the privacy-label table below, each **Not Linked to User Identity** and **Not Used for Tracking**, for Analytics and App Functionality. The manifest lists what the SDK may send, so it declares Performance Data and Crash Data even for an app that never calls `performance()` or turns on `captureUncaught`; your App Store label declares only what your app actually sends
 - **No required-reason APIs** — `NSPrivacyAccessedAPITypes` is an empty array
 
 Nothing else is declared, because nothing else is used — no file timestamps, no `UserDefaults` (the SDK has no persistent storage of any kind), no system boot time (session durations are wall-clock on purpose), no disk space, no active keyboards.
@@ -786,8 +880,9 @@ When submitting to the App Store, declare the following in App Store Connect (al
 | Category | Data Type | Why |
 |----------|-----------|-----|
 | Usage Data | Product Interaction | Feature counts, view counts, funnel steps |
-| Diagnostics | Other Diagnostic Data | Error and info events (name, level, code). Not *Crash Data* — nothing here captures crashes or stack traces |
-| Diagnostics | Performance Data | Performance metrics (duration digest — no individual measurements) |
+| Diagnostics | Other Diagnostic Data | Error and info events (name, level, code). Not *Crash Data* unless `captureUncaught` is on |
+| Diagnostics | Crash Data | **Only when `captureUncaught` is on**: a count of uncaught exceptions by name, with no reason, call stack or `userInfo` |
+| Diagnostics | Performance Data | Performance metrics (a duration digest, not individual records; a row with very few samples approximates their values), including `trackless.launch` and `trackless.hang` when `measureLaunch` or `detectHangs` is on |
 
 ATT is **not required**. See [Section 22.7 of the SDK requirements](https://github.com/trackless-telemetry/platform/blob/main/docs/requirements/sdks.md#227-app-store-privacy-compliance-guidance) for full guidance.
 

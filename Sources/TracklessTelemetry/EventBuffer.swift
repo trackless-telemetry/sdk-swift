@@ -24,14 +24,17 @@ actor EventBuffer {
     private var individual: [TracklessEvent] = []
     private let maxItems: Int
 
-    /// Local-time date formatter for date bucketing.
-    private let dateFormatter: DateFormatter = {
+    /// The payload `date` for `instant`: the local calendar day, `yyyy-MM-dd`.
+    ///
+    /// Static so the uncaught-exception path, which cannot reach this actor,
+    /// stamps its payload by the same rule.
+    static func payloadDate(for instant: Date) -> String {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd"
         formatter.timeZone = .current
         formatter.locale = Locale(identifier: "en_US_POSIX")
-        return formatter
-    }()
+        return formatter.string(from: instant)
+    }
 
     init(maxItems: Int = EventBuffer.defaultMaxItems) {
         self.maxItems = maxItems
@@ -127,7 +130,7 @@ actor EventBuffer {
 
         guard !allEvents.isEmpty else { return [] }
 
-        let date = dateFormatter.string(from: Date())
+        let date = Self.payloadDate(for: Date())
         var payloads: [TracklessEventPayload] = []
 
         var i = 0

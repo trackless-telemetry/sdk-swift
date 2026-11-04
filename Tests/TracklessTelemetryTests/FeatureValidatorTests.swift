@@ -1,6 +1,109 @@
 import Testing
 @testable import TracklessTelemetry
 
+/// The cross-SDK normalization table: input, then what is stored, or `nil` when it is rejected.
+/// `field-normalization-parity.test.ts` in the monorepo fails if these rows drift from its own.
+private let normalizationParityTable: [(input: String, stored: String?)] = [
+    ("123e4567-e89b-12d3-a456-426614174000", nil),
+    ("123E4567-E89B-12D3-A456-426614174000", nil),
+    ("550e8400_e29b_41d4_a716_446655440000", nil),
+    ("550e8400.e29b.41d4.a716.446655440000", nil),
+    ("550e8400 e29b 41d4 a716 446655440000", nil),
+    ("user-123e4567-e89b-12d3-a456-426614174000", nil),
+    ("err.123e4567-e89b-12d3-a456-426614174000", nil),
+    ("user-abcdefab-cdef-abcd-efab-cdefabcdefab", nil),
+    ("abcdefab-cdef-abcd-efab-cdefabcdefab_retry", nil),
+    ("checkout_flow_step_checkout_flow_step_checkout_flow_step_checkout_flow_step_checkout_flow_step_123e4567-e89b-12d3-a456-426614174000", nil),
+    ("507f1f77bcf86cd799439011", nil),
+    ("550e8400e29b41d4a716446655440000", nil),
+    ("tok_507f1f77bcf86cd799439011", nil),
+    ("tok-abcdefabcdefabcdefabcdef", nil),
+    ("tok_550e8400e29b41d4a716446655440000", nil),
+    ("tok-abcdefabcdefabcdefabcde", "tok-abcdefabcdefabcdefabcde"),
+    ("abcdefabcdefabcde", nil),
+    ("1234567890123", nil),
+    ("123e4567-e89b-12d3-a_redacted", nil),
+    ("550e8400e29b41d4a_redacted", nil),
+    ("user-6fe8b8e2-0bd_redacted_aeb89f4d624", nil),
+    ("tok_94efbda267a_redacted_a9061dd2", nil),
+    ("deadbeef-555-123-4567", nil),
+    ("555-123-4567", "redacted"),
+    ("+1 (555) 123-4567", "redacted"),
+    ("call 555-123-4567", "call_redacted"),
+    ("err.555-123-4567", "err._redacted"),
+    ("user@example.com", "redacted"),
+    ("signup_failed user@example.com", "signup_failed_redacted"),
+    ("123-45-6789", "redacted"),
+    ("settings.theme", "settings.theme"),
+    ("err_001", "err_001"),
+    ("java.lang.illegalstateexception", "java.lang.illegalstateexception"),
+    ("java.lang.IllegalStateException", "java.lang.illegalstateexception"),
+    ("Sign Up Button", "sign_up_button"),
+    ("cafe_fade_added", "cafe_fade_added"),
+    ("add_face_redacted", "add_face_redacted"),
+    ("123e4567", "123e4567"),
+    ("e10b90f6--b4f5--4c42--b4cf--317b5d116211", nil),
+    ("c2008c33__92bc__48b7__b93f__c0a61d76418a", nil),
+    ("1cae8043 - 4d24 - 4e22 - 956f - 698a933e3b5b", nil),
+    ("9b7ee1c2-9299-4ec0-af1e-c102392226c", nil),
+    ("7b59744c-d299-44ad-b30d", nil),
+    ("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.y", "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"),
+    ("deadbeefdead_555-123-4567", nil),
+    ("555-123-4567_12345678", nil),
+    ("trackless.uncaught", "trackless.uncaught"),
+    ("NSInvalidArgumentException", "nsinvalidargumentexception"),
+    ("TypeError", "typeerror"),
+    ("com.example.app.Checkout$PaymentException", "com.example.app.checkout_paymentexception"),
+    ("!!!", nil),
+    // An address may hold non-ASCII characters, but not a Unicode space; the rest of the value stays.
+    ("éric@example.com", "redacted"),
+    ("日本user@example.com", "redacted"),
+    ("user@example.comé", "redacted"),
+    ("signup é user@example.com", "signup_redacted"),
+    ("us\u{0301}er@example.com", "redacted"),
+    ("uſer@example.com", "redacted"),
+    ("\u{212A}evin@example.com", "redacted"),
+    ("user@exämple.com", "redacted"),
+    ("user@\u{0301}example.com", "redacted"),
+    ("josé@example.com", "redacted"),
+    ("user＠example.com", "user_example.com"),
+    ("user@localhost", "user_localhost"),
+    ("user@example.c0m", "user_example.c0m"),
+    ("日本語@example.com", "redacted"),
+    ("user@example.みんな", "redacted"),
+    ("user@example.com_x", "redacted__x"),
+    ("user@example.com2", "redacted_2"),
+    ("a@b.com_c@d.com", "redacted_redacted"),
+    ("login失敗user@example.com", "redacted"),
+    ("clicked\u{3000}user@example.com", "clicked_redacted"),
+    ("user@example.com\u{00A0}clicked", "redacted_clicked"),
+    ("abc😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀@example.com", "redacted"),
+    ("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx@example.com", "xxxxxx_redacted"),
+    ("a@b.com-c@d.com", "redacted_redacted"),
+    ("x .foo@example.com", "x_redacted"),
+    ("é123456789", "redacted"),
+    ("123456789é", "redacted"),
+    ("日本123-45-6789", "redacted"),
+    ("123-45-6789é", "redacted"),
+    ("é555-123-4567", "redacted"),
+    // Non-ASCII digits are not digits to the patterns, and sanitizing removes them.
+    ("٠١٢٣٤٥٦٧٨", nil),
+    ("１２３４５６７８９", nil),
+    ("𝟏𝟐𝟑𝟒𝟓𝟔𝟕𝟖𝟗", nil),
+    ("٠١٢-٣٤-٥٦٧٨", "-_-"),
+    ("call ٠١٢٣٤٥٦٧٨", "call"),
+    ("12345٠67890", "12345_67890"),
+    ("٠123456789", "redacted"),
+    // Unicode spaces separate a phone number; other invisible characters do not.
+    ("555\u{00A0}123\u{00A0}4567", "redacted"),
+    ("555\u{FEFF}123\u{FEFF}4567", "redacted"),
+    ("555\u{202F}123\u{202F}4567", "redacted"),
+    ("555\u{3000}123\u{3000}4567", "redacted"),
+    ("555\u{000B}123\u{000B}4567", "redacted"),
+    ("555\u{0085}123\u{0085}4567", "555_123_4567"),
+    ("555\u{200B}123\u{200B}4567", "555_123_4567"),
+]
+
 @Suite("FeatureValidator Tests")
 struct FeatureValidatorTests {
 
@@ -222,5 +325,24 @@ struct FeatureValidatorTests {
         #expect(FeatureValidator.normalize("export_clicked") == "export_clicked")
         #expect(FeatureValidator.normalize("theme.dark") == "theme.dark")
         #expect(FeatureValidator.normalize("my-feature") == "my-feature")
+    }
+
+    @Test("The email pattern's limits keep a long value cheap")
+    func longValues() {
+        for value in [
+            String(repeating: "a", count: 200_000),
+            String(repeating: "日", count: 200_000),
+            "a@" + String(repeating: "b", count: 200_000),
+            String(repeating: "a@b", count: 70_000),
+        ] {
+            #expect(FeatureValidator.stripPII(value) == value)
+        }
+    }
+
+    @Test("Normalization matches the cross-SDK table")
+    func normalizationParity() {
+        for row in normalizationParityTable {
+            #expect(FeatureValidator.normalize(row.input) == row.stored, "input: \(row.input)")
+        }
     }
 }

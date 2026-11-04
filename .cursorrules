@@ -17,6 +17,7 @@ This package is `TracklessTelemetry`, a privacy-first iOS/macOS analytics SDK. O
    - `Trackless.performance("api_fetch", durationSeconds: 0.342)` — timing in seconds (optional threshold: `Trackless.performance("api_fetch", durationSeconds: 0.342, thresholdSeconds: 2.0)`)
    - `Trackless.error("payment_failed", code: "DECLINED")` — something went wrong; counts toward errors per session and every alert
    - `Trackless.info("tier", detail: "paid")` — something worth counting that the user did not do and that did not go wrong; never counts toward errors or alerts
+   - `Trackless.startTimer("checkout")` / `Trackless.stopTimer("checkout", thresholdSeconds: 2.0)` / `Trackless.cancelTimer("checkout")`, or `try await Trackless.measure("feed_load") { try await api.fetchFeed() }` — timing without reading a clock yourself; session end discards open timers
 
 ## Important Rules
 
@@ -28,6 +29,9 @@ This package is `TracklessTelemetry`, a privacy-first iOS/macOS analytics SDK. O
 - Store the API key in xcconfig or Info.plist, not hardcoded in committed source
 - Event names and fields (`detail`, `step`, `code`) are auto-normalized: lowercased, spaces/special chars replaced with `_`, trimmed, truncated to 100 chars. Developers can pass natural strings like `"Sign Up Button"` (becomes `"sign_up_button"`). Use the optional `detail` parameter on `feature()` and `view()` to distinguish variants — dashboard auto-groups features with detail values into donut charts
 - Performance duration is in **seconds**, not milliseconds
+- For launch time and main-thread hangs, use `configure(..., measureLaunch: true, detectHangs: true)` instead of hand-rolled metrics. A launch longer than 60 seconds is dropped, so a background launch opened later sends none; one opened within 60 seconds still counts. Both are off by default; turning either on means the app must declare **Diagnostics → Performance Data** on its App Store privacy label — tell the developer
+- To count uncaught exceptions, use `configure(..., captureUncaught: true)`: each uncaught `NSException` is sent as `error("trackless.uncaught", code: <exception name>)`, with no reason or call stack, chained to any crash reporter already installed. Most Swift crashes (force-unwrap, `fatalError`, index out of range) are signals and are not counted, so never call the count a crash rate. Off by default; turning it on means the app must declare **Diagnostics → Crash Data** on its App Store privacy label — tell the developer. With it off, the SDK captures no crashes
+- Names starting with `trackless.` are reserved for the SDK's own events (`trackless.launch`, `trackless.hang`, `trackless.uncaught`) — never pass one to `performance()`, `startTimer`, `measure`, `error()` or `info()`
 - All methods are non-blocking, non-throwing, and safe to call from any thread
 - Environment auto-detects: DEBUG → `.sandbox`, Release → `.production`
 - App version and build number are auto-read from Bundle.main

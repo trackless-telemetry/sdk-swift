@@ -18,6 +18,12 @@
 		UserDefaults (no persistent storage of any kind), system boot time
 		(session duration is wall-clock, deliberately — see CHANGELOG 0.5.0),
 		disk space, and active keyboards.
+
+		The collected data types list what the SDK may send, not what every app
+		sends: Performance Data covers performance() and the opt-in measureLaunch
+		and detectHangs metrics, and Crash Data covers the opt-in captureUncaught
+		count of uncaught exceptions by name (no reason, call stack or userInfo).
+		An app that never turns an option on still ships the declaration.
 	-->
 	<key>NSPrivacyTracking</key>
 	<false/>
@@ -56,6 +62,19 @@
 		<dict>
 			<key>NSPrivacyCollectedDataType</key>
 			<string>NSPrivacyCollectedDataTypePerformanceData</string>
+			<key>NSPrivacyCollectedDataTypeLinked</key>
+			<false/>
+			<key>NSPrivacyCollectedDataTypeTracking</key>
+			<false/>
+			<key>NSPrivacyCollectedDataTypePurposes</key>
+			<array>
+				<string>NSPrivacyCollectedDataTypePurposeAnalytics</string>
+				<string>NSPrivacyCollectedDataTypePurposeAppFunctionality</string>
+			</array>
+		</dict>
+		<dict>
+			<key>NSPrivacyCollectedDataType</key>
+			<string>NSPrivacyCollectedDataTypeCrashData</string>
 			<key>NSPrivacyCollectedDataTypeLinked</key>
 			<false/>
 			<key>NSPrivacyCollectedDataTypeTracking</key>

@@ -27,6 +27,18 @@ struct TracklessConfig: Sendable {
     /// supported range, so the state actor can warn through the normal
     /// suppression-aware path rather than logging from a static method.
     let sessionIdleTimeoutWasClamped: Bool
+    /// Send `trackless.launch` once per process. Off by default.
+    let measureLaunch: Bool
+    /// Threshold for `trackless.launch`; nil sends none. Validated at the
+    /// public boundary, like the idle timeout.
+    let launchThresholdSeconds: Double?
+    /// Set by `Trackless.configure` when the caller's launch threshold was not
+    /// a positive number and was ignored, so the state actor can warn.
+    let launchThresholdWasIgnored: Bool
+    /// Send `trackless.hang` samples from the main-thread watchdog. Off by default.
+    let detectHangs: Bool
+    /// Count uncaught `NSException`s as `trackless.uncaught`. Off by default.
+    let captureUncaught: Bool
 
     init(
         apiKey: String = "",
@@ -38,7 +50,12 @@ struct TracklessConfig: Sendable {
         debugLogging: Bool = false,
         suppressWarnings: Bool = false,
         sessionIdleTimeoutSeconds: TimeInterval = Trackless.defaultSessionIdleTimeoutSeconds,
-        sessionIdleTimeoutWasClamped: Bool = false
+        sessionIdleTimeoutWasClamped: Bool = false,
+        measureLaunch: Bool = false,
+        launchThresholdSeconds: Double? = nil,
+        launchThresholdWasIgnored: Bool = false,
+        detectHangs: Bool = false,
+        captureUncaught: Bool = false
     ) {
         self.apiKey = apiKey
         self.endpoint = endpoint
@@ -50,6 +67,11 @@ struct TracklessConfig: Sendable {
         self.suppressWarnings = suppressWarnings
         self.sessionIdleTimeoutSeconds = sessionIdleTimeoutSeconds
         self.sessionIdleTimeoutWasClamped = sessionIdleTimeoutWasClamped
+        self.measureLaunch = measureLaunch
+        self.launchThresholdSeconds = launchThresholdSeconds
+        self.launchThresholdWasIgnored = launchThresholdWasIgnored
+        self.detectHangs = detectHangs
+        self.captureUncaught = captureUncaught
     }
 }
 
@@ -80,6 +102,20 @@ public final class Trackless: Sendable {
     /// means "a workday", and every session lands in the unbounded top duration
     /// bucket. iOS's effective timeout is zero — the session ends at background.
     public static let defaultSessionIdleTimeoutSeconds: TimeInterval = 300
+
+    /// Names starting with this are reserved for what the SDK sends itself.
+    /// `performance()`, `startTimer`, `measure`, `error()` and `info()` warn
+    /// once per process when given one, and send it anyway.
+    static let reservedNamePrefix = "trackless."
+
+    /// The metric `measureLaunch` sends.
+    static let launchMetricName = "trackless.launch"
+
+    /// The metric `detectHangs` sends.
+    static let hangMetricName = "trackless.hang"
+
+    /// The error name `captureUncaught` sends.
+    static let uncaughtErrorName = "trackless.uncaught"
 
     /// Supported range for `sessionIdleTimeoutSeconds`. Values outside it are
     /// clamped, with one warning.
@@ -120,6 +156,32 @@ public final class Trackless: Sendable {
     ///   may sit inactive before the current session ends; the next activation
     ///   starts a fresh one. Clamped to 30–3600 seconds, with one warning when it
     ///   is. Ignored on iOS, where a session ends when the app backgrounds.
+    /// - Parameter measureLaunch: Send the launch time once per process, as the
+    ///   performance metric `trackless.launch`: seconds from this
+    ///   `configure()` call to the app's first `didBecomeActive`. Nothing is
+    ///   sent when `configure()` runs after the app is already active, or when
+    ///   the launch is longer than 60 seconds, which is dropped, not clipped;
+    ///   that cap is also what leaves out a background launch the user opens
+    ///   later, while one opened within 60 seconds still counts. Off by
+    ///   default; turning it on means declaring Performance Data on the App
+    ///   Store privacy label.
+    /// - Parameter launchThresholdSeconds: Optional threshold for
+    ///   `trackless.launch`, so the breach count and performance alerts work on
+    ///   it. A value that is not a positive number is ignored, with a warning.
+    /// - Parameter detectHangs: Send each main-thread hang of 250 ms or more as
+    ///   one `trackless.hang` sample, in seconds, when the main thread
+    ///   recovers. The watchdog runs only while the app is active. Off by
+    ///   default; turning it on means declaring Performance Data on the App
+    ///   Store privacy label.
+    /// - Parameter captureUncaught: Count each `NSException` the app did not
+    ///   catch as `error("trackless.uncaught", code: <exception name>)`, sent
+    ///   with the session's end before the process exits (waiting at most
+    ///   1.5 s), then handed on to the previously installed handler. Only the
+    ///   exception's name is read — no reason, user info or call stack. Most
+    ///   Swift crashes (force-unwrap, `fatalError`, an index out of range) are
+    ///   signals, not exceptions, and are not counted; on macOS, AppKit catches
+    ///   exceptions raised during event handling. Off by default; turning it on
+    ///   means declaring Crash Data on the App Store privacy label.
     public static func configure(
         apiKey: String,
         endpoint: String = Trackless.defaultEndpoint,
@@ -129,9 +191,18 @@ public final class Trackless: Sendable {
         flushIntervalSeconds: TimeInterval = 60,
         debugLogging: Bool = false,
         suppressWarnings: Bool = false,
-        sessionIdleTimeoutSeconds: TimeInterval = Trackless.defaultSessionIdleTimeoutSeconds
+        sessionIdleTimeoutSeconds: TimeInterval = Trackless.defaultSessionIdleTimeoutSeconds,
+        measureLaunch: Bool = false,
+        launchThresholdSeconds: Double? = nil,
+        detectHangs: Bool = false,
+        captureUncaught: Bool = false
     ) {
         let clampedIdleTimeout = clampSessionIdleTimeout(sessionIdleTimeoutSeconds)
+        let validThreshold = launchThresholdSeconds.flatMap { $0.isFinite && $0 > 0 ? $0 : nil }
+        // Before the task: the launch clock starts at this call, on this thread.
+        if measureLaunch {
+            state.armLaunch()
+        }
         let config = TracklessConfig(
             apiKey: apiKey,
             endpoint: endpoint,
@@ -142,10 +213,16 @@ public final class Trackless: Sendable {
             debugLogging: debugLogging,
             suppressWarnings: suppressWarnings,
             sessionIdleTimeoutSeconds: clampedIdleTimeout,
-            sessionIdleTimeoutWasClamped: clampedIdleTimeout != sessionIdleTimeoutSeconds
+            sessionIdleTimeoutWasClamped: clampedIdleTimeout != sessionIdleTimeoutSeconds,
+            measureLaunch: measureLaunch,
+            launchThresholdSeconds: validThreshold,
+            launchThresholdWasIgnored: launchThresholdSeconds != nil && validThreshold == nil,
+            detectHangs: detectHangs,
+            captureUncaught: captureUncaught
         )
+        let timerCutoff = state.timers.currentSequence
         Task {
-            await state.configure(config)
+            await state.configure(config, timerCutoff: timerCutoff)
         }
     }
 
@@ -173,15 +250,135 @@ public final class Trackless: Sendable {
     }
 
     /// Record a performance measurement.
+    ///
+    /// Names starting with `trackless.` are reserved for what the SDK sends
+    /// itself (`trackless.launch`, `trackless.hang`). Passing one logs a
+    /// warning once per process; the measurement is still sent.
     public static func performance(_ name: String, durationSeconds: Double, thresholdSeconds: Double? = nil) {
         Task {
             await state.recordPerformance(name: name, durationSeconds: durationSeconds, thresholdSeconds: thresholdSeconds)
         }
     }
 
+    // MARK: - Timers
+
+    /// Start a timer for a performance measurement.
+    ///
+    /// The name is normalized here, exactly as `performance(_:durationSeconds:thresholdSeconds:)`
+    /// normalizes its name, so `stopTimer("Checkout")` closes `startTimer("checkout")`.
+    /// Starting a name that is already open restarts it. At most 50 timers are
+    /// open at once; a start past that is ignored, with one warning per session.
+    ///
+    /// Open timers live in memory only. **Session end discards every open
+    /// timer** — on iOS the session ends when the app backgrounds, on macOS when
+    /// the idle timeout expires — as do `setEnabled(false)`, a `configure()` with
+    /// changed settings and `destroy()`, so a timer never measures time the app
+    /// was not running.
+    public static func startTimer(_ name: String) {
+        state.startTimer(name)
+    }
+
+    /// Stop the timer `name` and send its elapsed time, in seconds, as
+    /// `performance(name, durationSeconds: elapsed, thresholdSeconds: thresholdSeconds)`.
+    ///
+    /// Does nothing when no timer of that name is open: never started, already
+    /// stopped or cancelled, or discarded when the session ended. Elapsed time
+    /// is wall-clock time; a value below zero or above a day means the clock
+    /// changed while the timer ran, and is dropped.
+    public static func stopTimer(_ name: String, thresholdSeconds: Double? = nil) {
+        state.stopTimer(name, thresholdSeconds: thresholdSeconds)
+    }
+
+    /// Drop the timer `name` without sending anything — the operation was
+    /// abandoned, or failed in a way its duration should not describe.
+    public static func cancelTimer(_ name: String) {
+        state.cancelTimer(name)
+    }
+
+    /// Time a synchronous closure and send its duration as a performance
+    /// measurement, returning the closure's result.
+    ///
+    /// The measurement is sent **only when `body` returns normally**. If it
+    /// throws, nothing is sent and the error is rethrown unchanged. Nothing is
+    /// sent either when the session ended while `body` ran. `measure` does not
+    /// use the open-timer map, so it never counts toward the 50-timer cap and
+    /// any number can nest.
+    ///
+    /// ```swift
+    /// let rows = try Trackless.measure("csv_parse", thresholdSeconds: 0.5) {
+    ///     try parser.parse(file)
+    /// }
+    /// ```
+    @discardableResult
+    public static func measure<T>(
+        _ name: String,
+        thresholdSeconds: Double? = nil,
+        _ body: () throws -> T
+    ) rethrows -> T {
+        try measure(on: state, name, thresholdSeconds: thresholdSeconds, body)
+    }
+
+    /// Time an asynchronous closure and send its duration as a performance
+    /// measurement, returning the closure's result.
+    ///
+    /// The measurement is sent **only when `body` returns normally**. If it
+    /// throws — including a `CancellationError` — nothing is sent and the error
+    /// is rethrown unchanged. Nothing is sent either when the session ended
+    /// while `body` was suspended (the app backgrounded mid-request, say).
+    /// `body` runs on the caller's actor.
+    ///
+    /// ```swift
+    /// let feed = try await Trackless.measure("feed_load", thresholdSeconds: 2.0) {
+    ///     try await api.fetchFeed()
+    /// }
+    /// ```
+    @discardableResult
+    public static func measure<T>(
+        _ name: String,
+        thresholdSeconds: Double? = nil,
+        isolation: isolated (any Actor)? = #isolation,
+        _ body: () async throws -> T
+    ) async rethrows -> T {
+        try await measure(on: state, name, thresholdSeconds: thresholdSeconds, body)
+    }
+
+    /// `measure` against a given state. `onSend` receives the task recording
+    /// the measurement (nil when nothing is sent), so tests can await it.
+    static func measure<T>(
+        on state: TracklessState,
+        _ name: String,
+        thresholdSeconds: Double?,
+        onSend: ((Task<Void, Never>?) -> Void)? = nil,
+        _ body: () throws -> T
+    ) rethrows -> T {
+        let start = state.timers.mark()
+        let result = try body()
+        let send = state.finishMeasure(name, start: start, thresholdSeconds: thresholdSeconds)
+        onSend?(send)
+        return result
+    }
+
+    static func measure<T>(
+        on state: TracklessState,
+        _ name: String,
+        thresholdSeconds: Double?,
+        onSend: ((Task<Void, Never>?) -> Void)? = nil,
+        isolation: isolated (any Actor)? = #isolation,
+        _ body: () async throws -> T
+    ) async rethrows -> T {
+        let start = state.timers.mark()
+        let result = try await body()
+        let send = state.finishMeasure(name, start: start, thresholdSeconds: thresholdSeconds)
+        onSend?(send)
+        return result
+    }
+
     /// Record an error event — something went wrong.
     ///
-    /// Counts toward errors per session and toward every alert.
+    /// Counts toward errors per session and toward every alert. Names starting
+    /// with `trackless.` are reserved for what the SDK sends itself
+    /// (`trackless.uncaught`): passing one logs a warning once per process,
+    /// and the event is still sent.
     public static func error(_ name: String, code: String? = nil) {
         Task {
             await state.recordError(name: name, severity: .error, code: code)
@@ -203,7 +400,8 @@ public final class Trackless: Sendable {
     /// per session and never triggers an alert. Report configuration many
     /// sessions share (a tier, a unit preference, a fallback path that fired),
     /// never anything about the person. Do not share a name between
-    /// `error(_:code:)` and `info(_:detail:)`.
+    /// `error(_:code:)` and `info(_:detail:)`. Names starting with `trackless.`
+    /// are reserved, as for `error(_:code:)`.
     public static func info(_ name: String, detail: String? = nil) {
         Task {
             await state.recordError(name: name, severity: .info, code: detail)
@@ -230,8 +428,9 @@ public final class Trackless: Sendable {
     /// Toggle event recording. Disabling discards buffered data and drops the session without
     /// sending its end; enabling again starts a new session.
     public static func setEnabled(_ isEnabled: Bool) {
+        let timerCutoff = state.timers.currentSequence
         Task {
-            await state.setEnabled(isEnabled)
+            await state.setEnabled(isEnabled, timerCutoff: timerCutoff)
         }
     }
 
@@ -282,6 +481,12 @@ actor TracklessState {
     nonisolated let clock: TracklessClock
     nonisolated let notificationCenter: NotificationCenter
     nonisolated let transport: TracklessTransport
+    /// Whether the app is active: `AppActivity.current` in production, which
+    /// answers nil off the main thread.
+    nonisolated let appIsActive: @Sendable () -> Bool?
+    /// Runs a block on the main queue. Shared by the hang watchdog's ping and
+    /// the main-thread re-reads of `appIsActive`.
+    nonisolated let postToMain: HangWatchdog.MainScheduler
 
     init(
         clock: TracklessClock = SystemClock(),
@@ -293,13 +498,53 @@ actor TracklessState {
                 payload: payload,
                 timeoutSeconds: timeoutSeconds
             )
-        }
+        },
+        appIsActive: @escaping @Sendable () -> Bool? = AppActivity.current,
+        postToMain: @escaping HangWatchdog.MainScheduler = HangWatchdog.mainQueue,
+        hangTicker: @escaping HangWatchdog.Ticker = HangWatchdog.dispatchTicker,
+        uncaughtSender: @escaping UncaughtExceptionCapture.Sender = UncaughtExceptionCapture.urlSessionSender,
+        uncaughtWaitSeconds: TimeInterval = UncaughtExceptionCapture.defaultWaitSeconds,
+        uncaughtHandlerSlot: any UncaughtHandlerSlot = ProcessUncaughtHandlerSlot()
     ) {
         self.clock = clock
         self.notificationCenter = notificationCenter
         self.transport = transport
+        self.appIsActive = appIsActive
+        self.postToMain = postToMain
         self.session = SessionManager(clock: clock)
+        self.timers = OpenTimers(clock: clock)
+        self.hangs = HangWatchdog(clock: clock, postToMain: postToMain, ticker: hangTicker)
+        self.uncaught = UncaughtExceptionCapture(
+            clock: clock,
+            sender: uncaughtSender,
+            waitSeconds: uncaughtWaitSeconds,
+            slot: uncaughtHandlerSlot
+        )
     }
+
+    /// Open timers. Read synchronously on the caller's thread — see
+    /// `OpenTimers` for why they are not actor state.
+    nonisolated let timers: OpenTimers
+
+    /// The `measureLaunch` probe. Belongs to the state, which production
+    /// creates once, so it measures once per process.
+    nonisolated let launch = LaunchProbe()
+
+    /// The `detectHangs` watchdog. Started and stopped synchronously from the
+    /// lifecycle notification blocks, on the main thread.
+    nonisolated let hangs: HangWatchdog
+
+    /// The `captureUncaught` handler. Its snapshot is replaced synchronously by
+    /// `refreshUncaughtCapture()` whenever what a send goes out under changes.
+    nonisolated let uncaught: UncaughtExceptionCapture
+
+    /// The observer for the launch probe's first activation. Separate from
+    /// `observerState`, which a reconfigure tears down: the launch clock must
+    /// keep running across one.
+    private nonisolated let launchObserverState = ObserverState()
+
+    /// Set once a reserved-prefix warning has been logged (once per process).
+    private nonisolated let reservedPrefixWarned = OnceFlag()
 
     /// Everything one flush sends under, read in a single synchronous step.
     ///
@@ -336,6 +581,12 @@ actor TracklessState {
 
     /// macOS idle timeout. Unused on iOS, where background ends the session.
     private var sessionIdleTimeoutSeconds: TimeInterval = Trackless.defaultSessionIdleTimeoutSeconds
+
+    // Opt-in SDK metrics
+    private var measureLaunch: Bool = false
+    private var launchThresholdSeconds: Double?
+    private var detectHangs: Bool = false
+    private var captureUncaught: Bool = false
 
     // Idle-window state (macOS)
 
@@ -406,7 +657,11 @@ actor TracklessState {
     /// retired flush is awaited last, after the new session, timer and
     /// observers are live: the actor is released while it waits on the network,
     /// so nothing recorded meanwhile is delayed, dropped or misattributed.
-    func configure(_ config: TracklessConfig) async {
+    ///
+    /// - Parameter timerCutoff: the open-timer sequence number captured when the
+    ///   caller invoked `Trackless.configure`. A changed configuration discards
+    ///   the timers started up to it; nil discards every one.
+    func configure(_ config: TracklessConfig, timerCutoff: UInt64? = nil) async {
         let resolvedEnvironment = config.environment ?? Trackless.detectEnvironment()
 
         var retired: (target: FlushTarget, session: SessionManager)?
@@ -418,6 +673,8 @@ actor TracklessState {
                 }
                 return
             }
+            // The running session is ending, so its open timers go with it.
+            timers.discardAll(through: timerCutoff)
             // A disabled configuration has nothing to report: its buffer was
             // discarded, and its session must not send an end.
             if enabled {
@@ -429,6 +686,7 @@ actor TracklessState {
         timerState.cancelTimer()
         idleTimerState.cancelTimer()
         cleanupObserver()
+        hangs.disable()
 
         apiKey = config.apiKey
         endpoint = config.endpoint
@@ -438,6 +696,10 @@ actor TracklessState {
         debugLogging = config.debugLogging
         suppressWarnings = config.suppressWarnings
         sessionIdleTimeoutSeconds = config.sessionIdleTimeoutSeconds
+        measureLaunch = config.measureLaunch
+        launchThresholdSeconds = config.launchThresholdSeconds
+        detectHangs = config.detectHangs
+        captureUncaught = config.captureUncaught
         enabled = config.enabled
         destroyed = false
         configured = true
@@ -453,6 +715,9 @@ actor TracklessState {
         funnels = FunnelTracker()
         featureFirstUses = FeatureFirstUseTracker()
         errorFirstOccurrences = ErrorFirstOccurrenceTracker()
+        // Before the first suspension point: from here an uncaught exception
+        // goes out under the new settings and the new session, or not at all.
+        refreshUncaughtCapture()
 
         if debugLogging {
             logger.info("[Trackless] configured — env=\(self.environment.rawValue, privacy: .public) flush=\(Int(self.flushIntervalSeconds))s")
@@ -465,12 +730,19 @@ actor TracklessState {
                     + "\(Int(sessionIdleTimeoutSeconds))s"
             )
         }
+        if config.launchThresholdWasIgnored {
+            warn("launchThresholdSeconds is not a positive number — trackless.launch is sent without a threshold")
+        }
 
         if enabled {
             await startNewSession()
             startPeriodicFlush()
             addLifecycleObservers()
+            startHangDetectionIfWanted()
         }
+        // A launch the probe measured before this configure ran (the tasks
+        // behind configure and the activation are unordered) is delivered now.
+        await deliverLaunch()
 
         if let retired {
             if let result = await retired.session.end() {
@@ -494,6 +766,10 @@ actor TracklessState {
             && config.debugLogging == debugLogging
             && config.suppressWarnings == suppressWarnings
             && config.sessionIdleTimeoutSeconds == sessionIdleTimeoutSeconds
+            && config.measureLaunch == measureLaunch
+            && config.launchThresholdSeconds == launchThresholdSeconds
+            && config.detectHangs == detectHangs
+            && config.captureUncaught == captureUncaught
     }
 
     private func currentFlushTarget() -> FlushTarget {
@@ -574,19 +850,300 @@ actor TracklessState {
             return
         }
         guard let normalized = normalizeName(name) else { return }
+        warnIfReserved(normalized)
         guard durationSeconds >= 0 else {
             warnDrop("negative duration (\(durationSeconds))", type: "performance", name: normalized)
             return
         }
+        await appendPerformance(normalized: normalized, durationSeconds: durationSeconds, thresholdSeconds: thresholdSeconds)
+    }
+
+    // MARK: - Timers
+
+    /// Start (or restart) the open timer for `name`. Synchronous: the clock is
+    /// read on the caller's thread, so a `stopTimer` called after it always
+    /// finds it.
+    ///
+    /// - Returns: the task delivering a warning, when there is one (tests await
+    ///   it; `Trackless.startTimer` discards it).
+    @discardableResult
+    nonisolated func startTimer(_ name: String) -> Task<Void, Never>? {
+        guard let normalized = FeatureValidator.normalize(name) else {
+            return Task { await self.reportRejectedName() }
+        }
+        let reserved = claimReservedWarning(normalized)
+        var capWarning = false
+        if case .capReached(let shouldWarn) = timers.start(normalized) {
+            capWarning = shouldWarn
+        }
+        guard reserved || capWarning else { return nil }
+        return Task {
+            if reserved { await self.warnReserved(normalized) }
+            if capWarning {
+                await self.warn(
+                    "timer \"\(normalized)\" not started — \(OpenTimers.maxOpen) timers are already open "
+                        + "(logged once per session)"
+                )
+            }
+        }
+    }
+
+    /// Close the open timer for `name` and send its elapsed time as a
+    /// performance measurement. Nothing is sent when no timer of that name is
+    /// open — never started, already stopped or cancelled, or discarded at
+    /// session end.
+    ///
+    /// - Returns: the task that records the measurement, or nil when nothing is
+    ///   sent.
+    @discardableResult
+    nonisolated func stopTimer(_ name: String, thresholdSeconds: Double? = nil) -> Task<Void, Never>? {
+        guard let normalized = FeatureValidator.normalize(name),
+              let elapsed = timers.stop(normalized) else { return nil }
+        return Task {
+            await self.recordTimer(normalizedName: normalized, elapsedSeconds: elapsed, thresholdSeconds: thresholdSeconds)
+        }
+    }
+
+    /// Drop the open timer for `name` without sending anything.
+    nonisolated func cancelTimer(_ name: String) {
+        guard let normalized = FeatureValidator.normalize(name) else { return }
+        timers.cancel(normalized)
+    }
+
+    /// Send the measurement for one `measure` call whose body returned.
+    /// Nothing is sent when the session ended while the body ran.
+    @discardableResult
+    nonisolated func finishMeasure(
+        _ name: String,
+        start: OpenTimers.Start,
+        thresholdSeconds: Double?
+    ) -> Task<Void, Never>? {
+        guard let elapsed = timers.elapsed(since: start) else { return nil }
+        guard let normalized = FeatureValidator.normalize(name) else {
+            return Task { await self.reportRejectedName() }
+        }
+        let reserved = claimReservedWarning(normalized)
+        return Task {
+            if reserved { await self.warnReserved(normalized) }
+            await self.recordTimer(normalizedName: normalized, elapsedSeconds: elapsed, thresholdSeconds: thresholdSeconds)
+        }
+    }
+
+    /// The send behind `stopTimer` and `measure`: `performance()` with an
+    /// elapsed time the SDK measured. An elapsed time below zero or above a day
+    /// can only come from the wall clock moving, and is dropped.
+    func recordTimer(normalizedName name: String, elapsedSeconds: Double, thresholdSeconds: Double?) async {
+        guard canRecord() else {
+            warnNotRecording(type: "performance")
+            return
+        }
+        guard elapsedSeconds >= 0, elapsedSeconds <= OpenTimers.maxElapsedSeconds else {
+            warnDrop(
+                "timer elapsed time \(elapsedSeconds)s is outside 0–\(Int(OpenTimers.maxElapsedSeconds))s "
+                    + "(the clock changed while it ran)",
+                type: "performance",
+                name: name
+            )
+            return
+        }
+        await appendPerformance(normalized: name, durationSeconds: elapsedSeconds, thresholdSeconds: thresholdSeconds)
+    }
+
+    /// Warn and notify `onError` for a timer name that failed normalization,
+    /// exactly as `performance()` does for its name.
+    private func reportRejectedName() {
+        warn("event name rejected — \(invalidEventNameReason)")
+        onError?(TracklessError.invalidFeatureName(invalidEventNameReason))
+    }
+
+    /// Buffer one performance measurement whose name is already normalized.
+    ///
+    /// - Parameter countsAsActivity: false for the metrics the SDK measures
+    ///   itself, which describe the app rather than anything the user did, so
+    ///   they leave the session's depth alone.
+    private func appendPerformance(
+        normalized: String,
+        durationSeconds: Double,
+        thresholdSeconds: Double?,
+        countsAsActivity: Bool = true
+    ) async {
         if let thresholdSeconds, thresholdSeconds <= 0 { return }
 
-        await session.recordActivity()
+        if countsAsActivity {
+            await session.recordActivity()
+        }
         await addToBuffer(TracklessEvent(type: .performance, name: normalized, duration: durationSeconds, threshold: thresholdSeconds))
         if debugLogging {
             let thresholdStr = thresholdSeconds.map { " threshold=\($0)s" } ?? ""
             logger.info("[Trackless] performance — \(normalized, privacy: .public) duration=\(durationSeconds)s\(thresholdStr, privacy: .public)")
         }
         await checkFlushThreshold()
+    }
+
+    // MARK: - Reserved names
+
+    /// Whether `normalized` is a reserved name whose once-per-process warning
+    /// has not been logged yet. Claims the warning when it is.
+    nonisolated func claimReservedWarning(_ normalized: String) -> Bool {
+        normalized.hasPrefix(Trackless.reservedNamePrefix) && reservedPrefixWarned.claim()
+    }
+
+    /// `performance()` path: warn once per process for a reserved name.
+    private func warnIfReserved(_ normalized: String) {
+        if claimReservedWarning(normalized) { warnReserved(normalized) }
+    }
+
+    /// - Parameter kind: the call that was given the name: "performance"
+    ///   (also `startTimer` and `measure`), "error" or "info".
+    private func warnReserved(_ normalized: String, kind: String = "performance") {
+        warn(
+            "\(kind) name \"\(normalized)\" starts with \"\(Trackless.reservedNamePrefix)\", which is "
+                + "reserved for names the SDK sends itself — sent anyway (logged once)"
+        )
+    }
+
+    // MARK: - Uncaught exceptions
+
+    /// Bring the uncaught-exception handler in line with the current state:
+    /// a snapshot of what a send needs while `captureUncaught` is on and the
+    /// SDK is recording, none otherwise. Installs the handler the first time
+    /// it is wanted; never removes it (see `UncaughtExceptionCapture`).
+    ///
+    /// Synchronous on purpose: callers run it with no suspension point between
+    /// the state change and this, so the handler never sends under settings
+    /// the SDK has already left.
+    private func refreshUncaughtCapture() {
+        guard captureUncaught, canRecord() else {
+            uncaught.update(nil)
+            return
+        }
+        uncaught.update(UncaughtSendSnapshot(
+            endpoint: endpoint,
+            apiKey: apiKey,
+            environment: environment,
+            context: context,
+            session: session
+        ))
+        uncaught.installIfNeeded()
+    }
+
+    // MARK: - Launch time
+
+    /// Arm the launch probe. Called synchronously from `Trackless.configure`
+    /// on the caller's thread, so the clock starts at the call and the
+    /// activation observer is in place before the configure task runs.
+    ///
+    /// When the app is already active, this is a late configure: the next
+    /// activation would be a return from the background, so nothing is
+    /// measured this process. Off the main thread the app's state cannot be
+    /// read synchronously; it is re-read on the main queue, which also runs
+    /// the activation notification, so the two cannot be misordered.
+    nonisolated func armLaunch() {
+        guard let activationName = AppActivity.didBecomeActive,
+              launch.arm(at: clock.now) else { return }
+
+        let observer = notificationCenter.addObserver(
+            forName: activationName,
+            object: nil,
+            queue: nil
+        ) { [weak self] _ in
+            self?.launchActivated()
+        }
+        launchObserverState.addObserver(observer)
+
+        switch appIsActive() {
+        case .some(true):
+            launchWasLate()
+        case .some(false):
+            break
+        case .none:
+            postToMain { [weak self] in
+                guard let self, self.appIsActive() == true else { return }
+                self.launchWasLate()
+            }
+        }
+    }
+
+    /// The first activation after the probe armed.
+    private nonisolated func launchActivated() {
+        let now = clock.now
+        removeLaunchObserver()
+        guard launch.activated(at: now) else { return }
+        Task { await self.deliverLaunch() }
+    }
+
+    private nonisolated func launchWasLate() {
+        launch.markLate()
+        removeLaunchObserver()
+    }
+
+    private nonisolated func removeLaunchObserver() {
+        for observer in launchObserverState.removeAllObservers() {
+            notificationCenter.removeObserver(observer)
+        }
+    }
+
+    /// Send the launch time the probe measured, once.
+    ///
+    /// Before the first configure has run, the measurement is left for the
+    /// configure to deliver. After that it is taken exactly once, and sent only
+    /// while recording with `measureLaunch` on: a launch measured while
+    /// recording is disabled, or after a reconfigure turned the option off, is
+    /// dropped.
+    func deliverLaunch() async {
+        guard configured || destroyed else { return }
+        guard let seconds = launch.takeMeasurement() else { return }
+        guard canRecord(), measureLaunch else { return }
+        await appendSDKMetric(Trackless.launchMetricName, seconds: seconds, thresholdSeconds: launchThresholdSeconds)
+    }
+
+    // MARK: - Hangs
+
+    /// Switch the watchdog on when `detectHangs` is set, and start it now when
+    /// the app is already active (a configure or re-enable while on screen);
+    /// otherwise it starts at the next activation.
+    private func startHangDetectionIfWanted() {
+        guard detectHangs else { return }
+        hangs.enable { [weak self] seconds in
+            guard let self else { return }
+            Task { await self.recordHang(seconds) }
+        }
+        let hangs = self.hangs
+        let appIsActive = self.appIsActive
+        switch appIsActive() {
+        case .some(true):
+            hangs.appBecameActive()
+        case .some(false):
+            break
+        case .none:
+            postToMain {
+                if appIsActive() == true { hangs.appBecameActive() }
+            }
+        }
+    }
+
+    func recordHang(_ seconds: TimeInterval) async {
+        guard canRecord(), detectHangs else { return }
+        await appendSDKMetric(Trackless.hangMetricName, seconds: seconds, thresholdSeconds: nil)
+    }
+
+    /// Buffer one SDK-measured metric. Same bounds as a timer; no reserved-name
+    /// warning, and no session activity.
+    private func appendSDKMetric(_ name: String, seconds: TimeInterval, thresholdSeconds: Double?) async {
+        guard seconds >= 0, seconds <= OpenTimers.maxElapsedSeconds else {
+            warnDrop(
+                "measured \(seconds)s is outside 0–\(Int(OpenTimers.maxElapsedSeconds))s (the clock changed)",
+                type: "performance",
+                name: name
+            )
+            return
+        }
+        await appendPerformance(
+            normalized: name,
+            durationSeconds: seconds,
+            thresholdSeconds: thresholdSeconds,
+            countsAsActivity: false
+        )
     }
 
     /// Shared path behind `Trackless.error(_:code:)`, the deprecated
@@ -604,6 +1161,9 @@ actor TracklessState {
         guard let normalized = normalizeName(name) else { return }
 
         let stored = Trackless.storedSeverity(severity)
+        if claimReservedWarning(normalized) {
+            warnReserved(normalized, kind: stored == .info ? "info" : "error")
+        }
 
         let normalizedCode: String? = if let code, !code.isEmpty {
             FeatureValidator.normalize(code)
@@ -643,10 +1203,17 @@ actor TracklessState {
         await performFlush(currentFlushTarget())
     }
 
-    func setEnabled(_ enabled: Bool) async {
+    /// - Parameter timerCutoff: the open-timer sequence number captured when the
+    ///   caller invoked `Trackless.setEnabled`. Disabling discards the timers
+    ///   started up to it; nil discards every one.
+    func setEnabled(_ enabled: Bool, timerCutoff: UInt64? = nil) async {
         self.enabled = enabled
+        // Synchronously, before any suspension: disabling must stop an uncaught
+        // send at once, and re-enabling points it at the configuration again.
+        refreshUncaughtCapture()
         if !enabled {
             // Drop the session rather than end it: an opt-out must not lead to a later send.
+            timers.discardAll(through: timerCutoff)
             await buffer.clear()
             await session.destroy()
             await funnels.clear()
@@ -656,6 +1223,7 @@ actor TracklessState {
             idleTimerState.cancelTimer()
             idleDeadline = nil
             cleanupObserver()
+            hangs.disable()
         } else if !destroyed && configured {
             // Remove first: re-enabling twice would otherwise register a second
             // set of observers on top of the first.
@@ -663,12 +1231,14 @@ actor TracklessState {
             await startNewSession()
             startPeriodicFlush()
             addLifecycleObservers()
+            startHangDetectionIfWanted()
         }
     }
 
     func destroy() async {
         guard !destroyed else { return }
         destroyed = true
+        refreshUncaughtCapture()
 
         await endCurrentSession()
         await performFlush(currentFlushTarget())
@@ -677,6 +1247,7 @@ actor TracklessState {
         idleTimerState.cancelTimer()
         idleDeadline = nil
         cleanupObserver()
+        hangs.disable()
         await session.destroy()
         configured = false
     }
@@ -736,8 +1307,7 @@ actor TracklessState {
     /// is commonly forwarded to a crash reporter.
     private func normalizeName(_ name: String) -> String? {
         guard let normalized = FeatureValidator.normalize(name) else {
-            warn("event name rejected — \(invalidEventNameReason)")
-            onError?(TracklessError.invalidFeatureName(invalidEventNameReason))
+            reportRejectedName()
             return nil
         }
         return normalized
@@ -751,7 +1321,15 @@ actor TracklessState {
         }
     }
 
-    private func endCurrentSession() async {
+    /// - Parameter timerCutoff: the open-timer sequence number captured at the
+    ///   moment the end was decided — in the lifecycle notification block or
+    ///   the idle timer's handler, before its task. Only timers started up to
+    ///   it are discarded, so one started after the app came back, but before
+    ///   this task ran, survives. Nil discards every one.
+    private func endCurrentSession(timerCutoff: UInt64? = nil) async {
+        // Before the guard: a destroy() after setEnabled(false) has no session
+        // to end, but may still hold timers started since.
+        timers.discardAll(through: timerCutoff)
         guard let result = await session.end() else { return }
         await funnels.clear()
         await featureFirstUses.clear()
@@ -759,7 +1337,9 @@ actor TracklessState {
         await addToBuffer(Self.sessionEndEvent(result))
     }
 
-    private static func sessionEndEvent(_ result: (duration: Int, depth: Int)) -> TracklessEvent {
+    /// The `session/end` event for an ended session. Shared with the
+    /// uncaught-exception send.
+    static func sessionEndEvent(_ result: (duration: Int, depth: Int)) -> TracklessEvent {
         TracklessEvent(
             type: .session,
             name: "end",
@@ -889,8 +1469,10 @@ actor TracklessState {
         ) { [weak self] _ in
             guard let self else { return }
             let stamp = self.clock.now
+            let timerCutoff = self.timers.currentSequence
+            self.hangs.appResignedActive()
             Task {
-                await self.handleAppDidEnterBackground(at: stamp)
+                await self.handleAppDidEnterBackground(at: stamp, timerCutoff: timerCutoff)
             }
         }
         observerState.addObserver(backgroundObserver)
@@ -902,11 +1484,33 @@ actor TracklessState {
         ) { [weak self] _ in
             guard let self else { return }
             let stamp = self.clock.now
+            let timerCutoff = self.timers.currentSequence
             Task {
-                await self.handleAppDidBecomeActive(at: stamp)
+                await self.handleAppDidBecomeActive(at: stamp, timerCutoff: timerCutoff)
             }
         }
         observerState.addObserver(foregroundObserver)
+
+        // The hang watchdog follows active / resign-active rather than
+        // foreground / background: it runs only while the app takes input.
+        // `queue: nil`, so it starts and stops on the posting (main) thread.
+        let activeObserver = notificationCenter.addObserver(
+            forName: UIApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: nil
+        ) { [weak self] _ in
+            self?.hangs.appBecameActive()
+        }
+        observerState.addObserver(activeObserver)
+
+        let resignObserver = notificationCenter.addObserver(
+            forName: UIApplication.willResignActiveNotification,
+            object: nil,
+            queue: nil
+        ) { [weak self] _ in
+            self?.hangs.appResignedActive()
+        }
+        observerState.addObserver(resignObserver)
     }
     #endif
 
@@ -925,6 +1529,7 @@ actor TracklessState {
         ) { [weak self] _ in
             guard let self else { return }
             let stamp = self.clock.now
+            self.hangs.appResignedActive()
             Task {
                 await self.handleAppDidResignActive(at: stamp)
             }
@@ -938,8 +1543,10 @@ actor TracklessState {
         ) { [weak self] _ in
             guard let self else { return }
             let stamp = self.clock.now
+            let timerCutoff = self.timers.currentSequence
+            self.hangs.appBecameActive()
             Task {
-                await self.handleAppDidBecomeActive(at: stamp)
+                await self.handleAppDidBecomeActive(at: stamp, timerCutoff: timerCutoff)
             }
         }
         observerState.addObserver(becomeActiveObserver)
@@ -975,9 +1582,12 @@ actor TracklessState {
 
     /// iOS/tvOS: the app entered the background. The session ends there and the
     /// end event is flushed immediately — iOS's effective idle timeout is zero.
-    func handleAppDidEnterBackground(at stamp: Date) async {
+    ///
+    /// - Parameter timerCutoff: `timers.currentSequence` read in the
+    ///   notification block; see `endCurrentSession(timerCutoff:)`.
+    func handleAppDidEnterBackground(at stamp: Date, timerCutoff: UInt64? = nil) async {
         guard canRecord(), acceptLifecycleSignal(at: stamp) else { return }
-        await endCurrentSession()
+        await endCurrentSession(timerCutoff: timerCutoff)
         await performFlush(currentFlushTarget())
     }
 
@@ -1028,7 +1638,10 @@ actor TracklessState {
     ///   slept through the wake-up). End the session that should already have
     ///   ended — still reporting the duration truncated at resign — then start a
     ///   new one. Two events in one turn.
-    func handleAppDidBecomeActive(at stamp: Date) async {
+    ///
+    /// - Parameter timerCutoff: `timers.currentSequence` read in the
+    ///   notification block, for the past-the-window end.
+    func handleAppDidBecomeActive(at stamp: Date, timerCutoff: UInt64? = nil) async {
         guard canRecord(), acceptLifecycleSignal(at: stamp) else { return }
 
         // Defensive: a window closed without ending the session would leave
@@ -1051,7 +1664,7 @@ actor TracklessState {
         }
 
         if stamp >= deadline {
-            await endCurrentSession()
+            await endCurrentSession(timerCutoff: timerCutoff)
             await startNewSession()
             if debugLogging {
                 logger.info("[Trackless] became active past the idle boundary — ended and restarted the session")
@@ -1070,7 +1683,10 @@ actor TracklessState {
     /// the end event rides the next periodic flush. Waking the network on a Mac
     /// the user has walked away from, to post one counter, is exactly what App
     /// Nap exists to stop.
-    func handleIdleTimeout() async {
+    ///
+    /// - Parameter timerCutoff: `timers.currentSequence` read in the idle
+    ///   timer's handler, when the end was decided.
+    func handleIdleTimeout(timerCutoff: UInt64? = nil) async {
         // `nil` means the window was already closed — by a reactivation that
         // raced this timer, or by a previous firing. Either way there is nothing
         // to end, and this is what prevents a double `session/end`.
@@ -1079,7 +1695,7 @@ actor TracklessState {
         idleTimerState.cancelTimer()
 
         guard canRecord() else { return }
-        await endCurrentSession()
+        await endCurrentSession(timerCutoff: timerCutoff)
         if debugLogging {
             logger.info("[Trackless] idle timeout — session ended")
         }
@@ -1100,8 +1716,9 @@ actor TracklessState {
         timer.schedule(wallDeadline: .now() + seconds, leeway: .seconds(5))
         timer.setEventHandler { [weak self] in
             guard let self else { return }
+            let timerCutoff = self.timers.currentSequence
             Task {
-                await self.handleIdleTimeout()
+                await self.handleIdleTimeout(timerCutoff: timerCutoff)
             }
         }
         idleTimerState.setTimer(timer)
@@ -1263,6 +1880,23 @@ final class ObserverState: @unchecked Sendable {
         observers = []
         lock.unlock()
         return current
+    }
+}
+
+// MARK: - Once Flag (thread-safe)
+
+/// A flag that can be claimed once.
+final class OnceFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var claimed = false
+
+    /// True for the first caller only.
+    func claim() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !claimed else { return false }
+        claimed = true
+        return true
     }
 }
 

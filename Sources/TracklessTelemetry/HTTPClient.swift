@@ -33,6 +33,33 @@ enum HTTPClient {
         payload: TracklessEventPayload,
         timeoutSeconds: TimeInterval = flushTimeoutSeconds
     ) async throws -> SendResult {
+        let request = try makeRequest(
+            endpoint: endpoint,
+            apiKey: apiKey,
+            payload: payload,
+            timeoutSeconds: timeoutSeconds
+        )
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw URLError(.badServerResponse)
+        }
+
+        return SendResult(status: httpResponse.statusCode, body: data)
+    }
+
+    /// The POST request for one payload. Shared by `sendPayload` and the
+    /// uncaught-exception send, which cannot use the async API.
+    ///
+    /// - Throws: `URLError(.badURL)` for an unparseable endpoint, or the
+    ///   encoder's error.
+    static func makeRequest(
+        endpoint: String,
+        apiKey: String,
+        payload: TracklessEventPayload,
+        timeoutSeconds: TimeInterval
+    ) throws -> URLRequest {
         guard let url = URL(string: endpoint) else {
             throw URLError(.badURL)
         }
@@ -42,16 +69,7 @@ enum HTTPClient {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue(apiKey, forHTTPHeaderField: "X-Api-Key")
         request.timeoutInterval = timeoutSeconds
-
-        let encoder = JSONEncoder()
-        request.httpBody = try encoder.encode(payload)
-
-        let (data, response) = try await URLSession.shared.data(for: request)
-
-        guard let httpResponse = response as? HTTPURLResponse else {
-            throw URLError(.badServerResponse)
-        }
-
-        return SendResult(status: httpResponse.statusCode, body: data)
+        request.httpBody = try JSONEncoder().encode(payload)
+        return request
     }
 }

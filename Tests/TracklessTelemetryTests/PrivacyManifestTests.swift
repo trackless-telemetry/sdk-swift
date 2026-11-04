@@ -79,9 +79,11 @@ struct PrivacyManifestTests {
         #expect(!declared.contains("NSPrivacyAccessedAPICategoryActiveKeyboards"))
     }
 
-    /// These three must stay in step with the "App Store Privacy Labels" table
+    /// These four must stay in step with the "App Store Privacy Labels" table
     /// in README.md and GUIDE.md §9 — a customer reading one and submitting
     /// against the other is exactly the failure this is here to prevent.
+    /// Crash Data is declared because `captureUncaught` may send a count of
+    /// uncaught exceptions; the manifest lists what the SDK may collect.
     @Test("Collected data types match the documented App Store privacy labels")
     func collectedDataTypesMatchTheDocs() throws {
         let manifest = try manifest()
@@ -95,8 +97,48 @@ struct PrivacyManifestTests {
                 "NSPrivacyCollectedDataTypeProductInteraction",
                 "NSPrivacyCollectedDataTypeOtherDiagnosticData",
                 "NSPrivacyCollectedDataTypePerformanceData",
+                "NSPrivacyCollectedDataTypeCrashData",
             ]
         )
+    }
+
+    /// `captureUncaught` counts uncaught exceptions, which Apple's App Privacy
+    /// details file under Crash Data. Shipping 0.6.0 without this entry was the
+    /// release blocker from the uncaught-exceptions privacy review.
+    @Test("Crash Data is declared, not linked, not tracking, with the usual purposes")
+    func crashDataIsDeclared() throws {
+        let manifest = try manifest()
+        let collected = try #require(
+            manifest["NSPrivacyCollectedDataTypes"] as? [[String: Any]]
+        )
+        let crash = try #require(
+            collected.first {
+                $0["NSPrivacyCollectedDataType"] as? String
+                    == "NSPrivacyCollectedDataTypeCrashData"
+            }
+        )
+        #expect(crash["NSPrivacyCollectedDataTypeLinked"] as? Bool == false)
+        #expect(crash["NSPrivacyCollectedDataTypeTracking"] as? Bool == false)
+        #expect(
+            Set(crash["NSPrivacyCollectedDataTypePurposes"] as? [String] ?? []) == [
+                "NSPrivacyCollectedDataTypePurposeAnalytics",
+                "NSPrivacyCollectedDataTypePurposeAppFunctionality",
+            ]
+        )
+    }
+
+    /// The docs must say Crash Data is declared only because of `captureUncaught`
+    /// — and must say it at all. The label table in each document names it.
+    @Test("README and GUIDE name Crash Data in their label tables")
+    func docsNameCrashData() throws {
+        for doc in ["README.md", "GUIDE.md"] {
+            let text = try String(
+                contentsOf: Self.packageRoot.appendingPathComponent(doc),
+                encoding: .utf8
+            )
+            #expect(text.contains("Crash Data"), "\(doc) must name Crash Data")
+            #expect(text.contains("captureUncaught"), "\(doc) must tie it to captureUncaught")
+        }
     }
 
     @Test("Nothing collected is linked to the user or used for tracking")
