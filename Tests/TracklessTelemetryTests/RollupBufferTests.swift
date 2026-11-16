@@ -1,4 +1,5 @@
 import Testing
+import Foundation
 @testable import TracklessTelemetry
 
 @Suite("EventBuffer Tests")
@@ -102,6 +103,41 @@ struct EventBufferTests {
 
         let payloads = await buffer.drain(environment: "production", context: testContext)
         #expect(payloads[0].events.count == 2)
+    }
+
+    @Test("Identical funnel steps are never rolled up and carry no count")
+    func identicalFunnelStepsNotRolledUp() async {
+        // A rolled-up funnel event would carry count > 1, which ingest rejects with a 400
+        // for the whole batch. Each call must stay its own event.
+        let buffer = EventBuffer()
+        for _ in 0..<3 {
+            await buffer.add(TracklessEvent(type: .funnel, name: "checkout", step: "cart", stepIndex: 0))
+        }
+
+        let size = await buffer.totalSize
+        #expect(size == 3)
+
+        let payloads = await buffer.drain(environment: "production", context: testContext)
+        let funnels = payloads.flatMap { $0.events }.filter { $0.type == .funnel }
+        #expect(funnels.count == 3)
+        #expect(funnels.allSatisfy { $0.count == nil })
+    }
+
+    @Test("Encoded funnel events have no count key")
+    func funnelEventEncodesWithoutCount() async throws {
+        let buffer = EventBuffer()
+        await buffer.add(TracklessEvent(type: .funnel, name: "checkout", step: "cart", stepIndex: 0))
+        await buffer.add(TracklessEvent(type: .funnel, name: "checkout", step: "cart", stepIndex: 0))
+
+        let payloads = await buffer.drain(environment: "production", context: testContext)
+        let data = try JSONEncoder().encode(payloads[0])
+        let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+        let events = json["events"] as! [[String: Any]]
+        #expect(events.count == 2)
+        for event in events {
+            #expect(event["type"] as? String == "funnel")
+            #expect(event.keys.contains("count") == false)
+        }
     }
 
     // MARK: - Drain Produces Correct Payload

@@ -5,6 +5,16 @@ All notable changes to the Trackless Telemetry Swift SDK (iOS and macOS) will be
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-11-16
+
+### Changed
+
+- **Funnel steps are no longer deduplicated per session; every call to `funnel(_:stepIndex:step:)` counts**, the way `feature()` does. Calling the same step index again in one session sends it again, so a user who runs a flow three times in one session counts three times at each step they reach. Each call is still sent as its own event, with no `count`. Apps that repeat a flow within a session will see higher step counts, a shift in conversion between steps, and more metered events after upgrading. Call `funnel()` when the step happens, not when a view renders: SwiftUI's `onAppear` can fire more than once for one visit. When upgrading, search the app for `funnel(` calls in a SwiftUI `body`, `onAppear`, `.task`, `viewDidAppear` / `viewWillAppear` or data reload and move each into the code for the action that completes the step.
+
+### Fixed
+
+- **An invalid `appVersion` or `buildNumber` is left out instead of costing the app every batch.** Ingest validates the whole payload, so an Info.plist `CFBundleShortVersionString` or `CFBundleVersion` that is empty or holds anything but letters, digits, `.`, `_` and `-` (1–50 characters), such as `1.0 beta`, used to make every flush fail with a 400 and the SDK drop it. `configure()` now checks both values, and the `osVersion` it derives, against ingest's rules, leaves a failing one out of every payload and logs one warning that names the field, not its value. Events are then counted with no version on them until the value is fixed.
+
 ## [0.6.0] - 2026-11-04
 
 ### Added

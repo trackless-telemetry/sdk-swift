@@ -615,7 +615,6 @@ actor TracklessState {
     private var circuitBreaker = CircuitBreaker()
     private var context = TracklessEventContext(platform: ContextDetection.platform)
     private var session: SessionManager
-    private var funnels = FunnelTracker()
     private var featureFirstUses = FeatureFirstUseTracker()
     private var errorFirstOccurrences = ErrorFirstOccurrenceTracker()
 
@@ -710,9 +709,10 @@ actor TracklessState {
 
         buffer = EventBuffer()
         circuitBreaker = CircuitBreaker()
-        context = ContextDetection.detect()
+        let detected = ContextDetection.detectReportingOmissions()
+        context = detected.context
+        for field in detected.omitted { warn(ContextDetection.omittedWarning(field)) }
         session = SessionManager(clock: clock)
-        funnels = FunnelTracker()
         featureFirstUses = FeatureFirstUseTracker()
         errorFirstOccurrences = ErrorFirstOccurrenceTracker()
         // Before the first suspension point: from here an uncaught exception
@@ -826,11 +826,9 @@ actor TracklessState {
         guard let normalizedFunnel = normalizeName(funnelName),
               let normalizedStep = normalizeName(stepName) else { return }
 
-        guard await funnels.step(funnelName: normalizedFunnel, stepIndex: stepIndex) else {
-            warnDrop("duplicate funnel step", type: "funnel", name: "\(normalizedFunnel).\(normalizedStep)")
-            return
-        }
-
+        // Every call counts, like feature(): no per-session dedup. The event is
+        // never rolled up (EventBuffer appends funnel events one by one), so it
+        // carries no `count` and ingest's limit of 1 on funnels holds.
         await session.recordActivity()
         await addToBuffer(TracklessEvent(
             type: .funnel,
@@ -1216,7 +1214,6 @@ actor TracklessState {
             timers.discardAll(through: timerCutoff)
             await buffer.clear()
             await session.destroy()
-            await funnels.clear()
             await featureFirstUses.clear()
             await errorFirstOccurrences.clear()
             timerState.cancelTimer()
@@ -1331,7 +1328,6 @@ actor TracklessState {
         // to end, but may still hold timers started since.
         timers.discardAll(through: timerCutoff)
         guard let result = await session.end() else { return }
-        await funnels.clear()
         await featureFirstUses.clear()
         await errorFirstOccurrences.clear()
         await addToBuffer(Self.sessionEndEvent(result))
@@ -1797,7 +1793,7 @@ actor TracklessState {
     }
 
     /// Test-only: end the current session (mirrors the lifecycle/destroy reset path,
-    /// clearing the funnel, first-use, and first-occurrence trackers).
+    /// clearing the first-use and first-occurrence trackers).
     func endSessionForTesting() async {
         await endCurrentSession()
     }

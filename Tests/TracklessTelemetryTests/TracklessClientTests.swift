@@ -122,39 +122,6 @@ struct TracklessClientTests {
         #expect(result == nil)
     }
 
-    // MARK: - Funnel Tracker
-
-    @Test("FunnelTracker accepts explicit step indices")
-    func funnelExplicitIndex() async {
-        let tracker = FunnelTracker()
-        let step0 = await tracker.step(funnelName: "checkout", stepIndex: 0)
-        let step1 = await tracker.step(funnelName: "checkout", stepIndex: 1)
-        let step2 = await tracker.step(funnelName: "checkout", stepIndex: 2)
-        #expect(step0 == true)
-        #expect(step1 == true)
-        #expect(step2 == true)
-    }
-
-    @Test("FunnelTracker deduplicates repeated step indices")
-    func funnelDedup() async {
-        let tracker = FunnelTracker()
-        let first = await tracker.step(funnelName: "checkout", stepIndex: 0)
-        let second = await tracker.step(funnelName: "checkout", stepIndex: 0)
-        #expect(first == true)
-        #expect(second == false)
-    }
-
-    @Test("FunnelTracker tracks independent funnels")
-    func funnelIndependent() async {
-        let tracker = FunnelTracker()
-        let a0 = await tracker.step(funnelName: "checkout", stepIndex: 0)
-        let b0 = await tracker.step(funnelName: "onboarding", stepIndex: 0)
-        let a1 = await tracker.step(funnelName: "checkout", stepIndex: 1)
-        #expect(a0 == true)
-        #expect(b0 == true)
-        #expect(a1 == true)
-    }
-
     // MARK: - Event Payload Structure
 
     @Test("TracklessEventPayload encodes to correct JSON structure")

@@ -62,13 +62,13 @@ In the `@main struct App { init() { ... } }` for SwiftUI, `application(_:didFini
 https://github.com/trackless-telemetry/sdk-swift
 ```
 
-Select version `0.6.0` or later. Add `TracklessTelemetry` to your app target.
+Select version `0.7.0` or later. Add `TracklessTelemetry` to your app target.
 
 ### Swift Package Manager (Package.swift)
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/trackless-telemetry/sdk-swift", from: "0.6.0")
+    .package(url: "https://github.com/trackless-telemetry/sdk-swift", from: "0.7.0")
 ]
 ```
 
@@ -202,7 +202,7 @@ Changing `measureLaunch`, `launchThresholdSeconds`, `detectHangs` or `captureUnc
 
 **Environment auto-detection:** In `DEBUG` builds, environment defaults to `.sandbox`. In release builds, it defaults to `.production`. Override by passing `environment:` explicitly.
 
-**App version auto-detection:** `appVersion` and `buildNumber` are automatically read from `Bundle.main` (`CFBundleShortVersionString` and `CFBundleVersion`). Both must be 1–50 characters of letters, digits, `.`, `_`, and `-`, or ingest rejects every packet — see Section 12.
+**App version auto-detection:** `appVersion` and `buildNumber` are automatically read from `Bundle.main` (`CFBundleShortVersionString` and `CFBundleVersion`). Both must be 1–50 characters of letters, digits, `.`, `_`, and `-`. A value that is not is left out of every payload with one warning at `configure()`, and everything else is still sent; the dashboard then has no version for that build — see Section 12.
 
 ## 3. Track Events
 
@@ -324,8 +324,8 @@ Trackless.funnel("onboarding", stepIndex: 3, step: "complete")
 
 **Rules:**
 - Step index is developer-defined (0-based) and determines the order of steps in funnel charts
-- Steps are deduplicated per session — calling the same step index twice is a no-op
-- Funnel state resets when the session ends
+- Every call counts, like `feature()`: calling the same step index twice sends it twice, in the same session or a later one. A user who runs a flow three times counts three times at each step they reach
+- Call `funnel()` when the step happens (the tap, the completed purchase), not when a view renders — SwiftUI's `onAppear` can fire more than once for one visit, and every call counts
 
 ### Performance Metrics
 
@@ -783,9 +783,6 @@ struct CheckoutFlow: View {
                 })
             case .confirmation:
                 OrderConfirmation()
-                    .onAppear {
-                        Trackless.funnel("checkout", stepIndex: 3, step: "order_complete")
-                    }
             }
         }
     }
@@ -799,6 +796,9 @@ struct CheckoutFlow: View {
                     "order_submission",
                     durationSeconds: CFAbsoluteTimeGetCurrent() - start
                 )
+                // When the order is placed, not in OrderConfirmation's onAppear:
+                // every funnel() call counts, and onAppear can fire more than once.
+                Trackless.funnel("checkout", stepIndex: 3, step: "order_complete")
                 step = .confirmation
             } catch {
                 Trackless.error(
@@ -857,7 +857,7 @@ Trackless collects **no user identifiers** and stores **only aggregate counts**:
 - **No performance measurement stored as its own record** — durations are aggregated server-side into statistical digests (t-digest); a row with very few samples approximates their values
 - **PII auto-stripping** — email addresses, phone numbers, and SSN patterns are automatically stripped from all event fields before buffering
 
-The only context collected is: platform (`"ios"`, or `"macos"` on a native AppKit build), OS version (major only, e.g., `"17"`), device class (phone/tablet/desktop), region (two-letter country code from `Locale.current`, e.g., `"US"`), language (ISO 639-1 code from `Locale.current`, e.g., `"en"`), app version, build number, and `sdkVersion` (automatically included, e.g., `"ios/0.6.0"` or `"macos/0.6.0"`). All are coarse, non-identifying dimensions.
+The only context collected is: platform (`"ios"`, or `"macos"` on a native AppKit build), OS version (major only, e.g., `"17"`), device class (phone/tablet/desktop), region (two-letter country code from `Locale.current`, e.g., `"US"`), language (ISO 639-1 code from `Locale.current`, e.g., `"en"`), app version, build number, and `sdkVersion` (automatically included, e.g., `"ios/0.7.0"` or `"macos/0.7.0"`). All are coarse, non-identifying dimensions.
 
 Every one of them is either a runtime property the OS exposes to every app (OS version, device class, locale, language) or a constant compiled into your app (version, build number, the `DEBUG` flag). Because the SDK reads no App Store receipt, a release build cannot tell an App Store install from TestFlight or a direct download; it sends no distribution channel at all.
 
@@ -951,7 +951,8 @@ The ingest endpoint's error responses are deliberately generic on the wire — t
 
 | Log signal                                                | What it means                                                                                                                                                                | What to do                                                                                                                                                                              |
 | --------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `flush rejected — HTTP 400`                               | The payload failed validation. Ingest validates the whole payload before it looks up the API key and rejects it outright; the SDK drops the batch and does not retry it. Event names and details are normalized before sending, so a 400 on every flush almost always means a context value fails its pattern: `appVersion` and `buildNumber` must be 1–50 characters of letters, digits, `.`, `_`, and `-` only (no spaces or parentheses). | Check the Info.plist version values the SDK reads: `CFBundleShortVersionString` and `CFBundleVersion` (Xcode's Version and Build). App Store builds already use numeric versions, but ad-hoc, enterprise, and development builds can carry free text such as `1.0 beta` — change it to a conforming value such as `1.0-beta` and rebuild. Until then every packet is rejected. |
+| `flush rejected — HTTP 400`                               | The payload failed validation. Ingest validates the whole payload before it looks up the API key and rejects it outright; the SDK drops the batch and does not retry it. Event names and details are normalized before sending, so a 400 on every flush is rare. `appVersion` and `buildNumber` are not the cause: the SDK leaves an invalid one out (see the next row). | Turn on `debugLogging` and check the names, details, steps and codes you send. If it persists on every flush, contact support with the SDK version. |
+| `appVersion (CFBundleShortVersionString in Info.plist) is not 1–50 letters, digits, ".", "_" or "-" — left out of every payload` (or the same for `buildNumber` and `CFBundleVersion`) | The Info.plist value is empty or holds a character ingest does not accept, such as a space or a parenthesis. The SDK leaves that one value out so the rest of the payload is accepted; events are counted, with no app version or build number on them. | Change Xcode's Version or Build to a conforming value, such as `1.0-beta` in place of `1.0 beta`, and rebuild. App Store builds already use numeric versions; ad-hoc, enterprise and development builds can carry free text. |
 | `flush rejected — HTTP 401`                               | Wrong or regenerated API key. Keys are shown once at creation; regenerating a key invalidates the old one immediately.                                                        | Get the current key from the dashboard and rebuild.                                                                                                                                       |
 | `flush rejected — HTTP 402`                               | The plan's monthly event quota is reached. The endpoint stops accepting events — nothing converts silently and nothing is billed as overage.                                  | Wait for the next billing period, or upgrade the plan in the dashboard.                                                                                                                   |
 | `flush rejected — HTTP 413`                               | The request body was over the 50 KB ingest limit or arrived without a `Content-Length` header. The SDK splits batches below 50 KB, so this points to a proxy or custom endpoint that rewrites the request, or a modified client. | Send to the Trackless endpoint directly, or make sure the proxy forwards the body unchanged with its `Content-Length`. |

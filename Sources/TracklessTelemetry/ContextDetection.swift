@@ -18,7 +18,7 @@ import UIKit
 enum ContextDetection {
 
     /// The version this build reports, without the platform prefix.
-    private static let version = "0.6.0"
+    private static let version = "0.7.0"
 
     /// The `platform` dimension for this build.
     ///
@@ -32,13 +32,19 @@ enum ContextDetection {
     static let platform = "ios"
     #endif
 
-    /// `<platform>/<version>`, e.g. `"macos/0.6.0"`. One Swift package publishes
+    /// `<platform>/<version>`, e.g. `"macos/0.7.0"`. One Swift package publishes
     /// both, so the version after the slash is the same on either platform.
     static let sdkVersion = "\(platform)/\(version)"
 
     /// Detect coarse device context. Captured once at configure time.
     static func detect() -> TracklessEventContext {
-        TracklessEventContext(
+        detectReportingOmissions().context
+    }
+
+    /// `detect()`, plus the names of the fields left out because ingest would
+    /// reject them (see `omittingInvalid(_:)`).
+    static func detectReportingOmissions() -> (context: TracklessEventContext, omitted: [String]) {
+        omittingInvalid(TracklessEventContext(
             platform: platform,
             osVersion: detectOsVersion(),
             deviceClass: detectDeviceClass(),
@@ -47,7 +53,72 @@ enum ContextDetection {
             appVersion: detectAppVersion(),
             buildNumber: detectBuildNumber(),
             sdkVersion: sdkVersion
+        ))
+    }
+
+    /// Leave out any of `appVersion`, `buildNumber` and `osVersion` that ingest
+    /// would reject. Ingest validates the whole payload, so one bad value (an
+    /// empty `CFBundleVersion`, a `CFBundleShortVersionString` of `"1.0 (42)"`)
+    /// would cost the app every batch; without the field the batch is accepted
+    /// and only that dimension is missing.
+    ///
+    /// Pure. `omitted` names the fields, never their values.
+    static func omittingInvalid(
+        _ context: TracklessEventContext
+    ) -> (context: TracklessEventContext, omitted: [String]) {
+        var omitted: [String] = []
+        func keep(_ value: String?, _ field: String, _ isValid: (String) -> Bool) -> String? {
+            guard let value else { return nil }
+            if isValid(value) { return value }
+            omitted.append(field)
+            return nil
+        }
+        let appVersion = keep(context.appVersion, "appVersion", isValidAppVersion)
+        let buildNumber = keep(context.buildNumber, "buildNumber", isValidAppVersion)
+        let osVersion = keep(context.osVersion, "osVersion", isValidOsVersion)
+        let cleaned = TracklessEventContext(
+            platform: context.platform,
+            osVersion: osVersion,
+            deviceClass: context.deviceClass,
+            region: context.region,
+            language: context.language,
+            appVersion: appVersion,
+            buildNumber: buildNumber,
+            sdkVersion: context.sdkVersion
         )
+        return (cleaned, omitted)
+    }
+
+    /// The warning for a field `omittingInvalid(_:)` left out. Names the field only.
+    static func omittedWarning(_ field: String) -> String {
+        if field == "osVersion" {
+            return "osVersion could not be read as a version number — left out of every payload"
+        }
+        let source = field == "appVersion" ? "CFBundleShortVersionString" : "CFBundleVersion"
+        return "\(field) (\(source) in Info.plist) is not 1–50 letters, digits, \".\", \"_\" or \"-\" "
+            + "— left out of every payload"
+    }
+
+    /// Ingest's rule for `appVersion` and `buildNumber`: 1–50 ASCII letters,
+    /// digits, `.`, `_` or `-`.
+    static func isValidAppVersion(_ value: String) -> Bool {
+        let scalars = value.unicodeScalars
+        guard (1...50).contains(scalars.count) else { return false }
+        return scalars.allSatisfy { scalar in
+            switch scalar {
+            case "a"..."z", "A"..."Z", "0"..."9", ".", "_", "-": return true
+            default: return false
+            }
+        }
+    }
+
+    /// Ingest's rule for `osVersion`: one to three dot-separated runs of ASCII digits.
+    static func isValidOsVersion(_ value: String) -> Bool {
+        let parts = value.split(separator: ".", omittingEmptySubsequences: false)
+        guard (1...3).contains(parts.count) else { return false }
+        return parts.allSatisfy { part in
+            !part.isEmpty && part.unicodeScalars.allSatisfy { ("0"..."9").contains($0) }
+        }
     }
 
     // MARK: - Private

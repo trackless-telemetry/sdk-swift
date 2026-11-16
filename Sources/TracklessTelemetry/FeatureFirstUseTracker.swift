@@ -9,9 +9,9 @@ import Foundation
 /// — a session that exercises several detail variants still contributes exactly one
 /// first-use (see feature-reach spec §25.4.1).
 ///
-/// Zero persistence — all state is in-memory only. Mirrors `FunnelTracker`: cleared
-/// on session end, and NOT on buffer flush (the buffer drains mid-session; this set
-/// must survive those drains).
+/// Zero persistence — all state is in-memory only. Cleared on session end, and NOT
+/// on buffer flush (the buffer drains mid-session; this set must survive those
+/// drains).
 actor FeatureFirstUseTracker {
 
     /// Normalized feature names seen at least once in the current session.
